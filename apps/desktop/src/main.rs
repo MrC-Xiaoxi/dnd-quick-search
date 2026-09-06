@@ -2,7 +2,10 @@ use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, RichTex
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use table_canon_core::{Hit, MetaPatch, SearchResult, Store, StoreInfo, VIS_PUBLIC, VIS_SECRET};
+use table_canon_core::{
+    Hit, ImportOpts, LlmConfig, LlmSplitter, MetaPatch, SearchResult, Store, StoreInfo,
+    VIS_PUBLIC, VIS_SECRET,
+};
 
 const SAMPLE_QUERY: &str = "我们之前在那个独眼酒保的店里拿到了货";
 
@@ -41,6 +44,7 @@ struct App {
     focus_search: bool,
     search_focused: bool,
     expanded: HashSet<i64>,
+    llm_enabled: bool,
 }
 
 impl App {
@@ -62,6 +66,7 @@ impl App {
             focus_search: true,
             search_focused: false,
             expanded: HashSet::new(),
+            llm_enabled: load_app_config().llm.enabled,
         };
         if let Some(p) = load_last_store_path() {
             match Store::open(&p) {
@@ -206,7 +211,26 @@ impl App {
             self.status = "请先新建或打开库，再导入。".into();
             return;
         };
-        match s.import_paths(&paths) {
+        let cfg = load_app_config();
+        let splitter = if self.llm_enabled {
+            LlmConfig::from_parts(&cfg.llm.base_url, &cfg.llm.api_key, &cfg.llm.model)
+                .map(LlmSplitter::new)
+        } else {
+            None
+        };
+        if self.llm_enabled && splitter.is_none() {
+            self.status =
+                "已勾选 LLM 拆条，但 config.toml 里 base_url / api_key / model 不完整。请先填好再导入。".into();
+            return;
+        }
+        if splitter.is_some() {
+            self.status = "正在用 LLM 拆条，导入可能要几分钟，窗口会暂时无响应…".into();
+        }
+        let opts = ImportOpts {
+            splitter: splitter.as_ref().map(|x| x as &dyn table_canon_core::EntrySplitter),
+            reprocess: splitter.is_some(),
+        };
+        match s.import_with(&paths, opts) {
             Ok(r) => {
                 self.status = format!(
                     "导入完成：成功 {} / 跳过 {} / 失败 {} / 条目 {} / 未挂修正 {}",
@@ -321,6 +345,15 @@ impl eframe::App for App {
                             self.pending = Some(Pending::Import(files));
                             ctx.request_repaint();
                         }
+                    }
+                    if ui
+                        .checkbox(&mut self.llm_enabled, "导入时 LLM 拆条")
+                        .on_hover_text("导入可变慢，查询仍在本地 5 秒内。密钥写在 %APPDATA%\\table-canon\\config.toml")
+                        .changed()
+                    {
+                        let mut c = load_app_config();
+                        c.llm.enabled = self.llm_enabled;
+                        save_app_config(&c);
                     }
                     if ui.button("导出便携库").clicked() {
                         if let Some(p) = rfd::FileDialog::new()
@@ -524,6 +557,47 @@ fn snippet_around(body: &str, query: &str, max_chars: usize) -> (String, bool) {
         s.push('…');
     }
     (s, true)
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct AppConfig {
+    #[serde(default)]
+    llm: LlmSection,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct LlmSection {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    model: String,
+}
+
+fn config_path() -> PathBuf {
+    appdata_dir().join("config.toml")
+}
+
+fn load_app_config() -> AppConfig {
+    let p = config_path();
+    match fs::read_to_string(&p) {
+        Ok(raw) => toml::from_str(&raw).unwrap_or_default(),
+        Err(_) => {
+            let cfg = AppConfig::default();
+            save_app_config(&cfg);
+            cfg
+        }
+    }
+}
+
+fn save_app_config(cfg: &AppConfig) {
+    let _ = fs::create_dir_all(appdata_dir());
+    if let Ok(text) = toml::to_string_pretty(cfg) {
+        let _ = fs::write(config_path(), text);
+    }
 }
 
 fn appdata_dir() -> PathBuf {

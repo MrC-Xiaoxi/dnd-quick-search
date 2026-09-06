@@ -1,0 +1,9 @@
+# 席间索桌面端配置（放在 %APPDATA%\table-canon\config.toml）
+# 导入时是否用 LLM 把章节拆成「一条一卡」。查询始终走本地索引，5 秒内返回。
+
+[llm]
+enabled = false
+# OpenAI 兼容 chat/completions 端点。EasyCLIProxyAPI 本地默认：http://127.0.0.1:8317/v1
+base_url = "http://127.0.0.1:8317/v1"
+api_key = "123456987"
+model = "gpt-4o-mini"

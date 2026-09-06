@@ -86,6 +86,19 @@ pub struct DraftChunk {
     pub content_hash: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExtractedEntry {
+    pub title: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub entity_type: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub heading_level: u8,
+}
+
 #[derive(Debug, Clone)]
 pub struct Block {
     pub heading_level: u8,

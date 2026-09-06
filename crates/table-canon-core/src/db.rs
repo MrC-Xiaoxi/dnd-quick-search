@@ -1,6 +1,7 @@
-use crate::ingest::{blocks_to_drafts, build_search_text, is_secret_markup_line, parse_file};
+use crate::ingest::{build_search_text, is_secret_markup_line, parse_file};
 use crate::normalize::{now_rfc3339, sha256_file_hex};
 use crate::search::{self, SearchQuery};
+use crate::split::{refine_drafts, EntrySplitter};
 use crate::types::*;
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -12,6 +13,12 @@ pub struct Store {
     pub path: PathBuf,
     conn: Connection,
     campaign_id: i64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ImportOpts<'a> {
+    pub splitter: Option<&'a dyn EntrySplitter>,
+    pub reprocess: bool,
 }
 
 impl Store {
@@ -148,6 +155,10 @@ impl Store {
     }
 
     pub fn import_paths(&mut self, paths: &[PathBuf]) -> Result<ImportReport> {
+        self.import_with(paths, ImportOpts::default())
+    }
+
+    pub fn import_with(&mut self, paths: &[PathBuf], opts: ImportOpts<'_>) -> Result<ImportReport> {
         let mut report = ImportReport::default();
         let mut files: Vec<(PathBuf, String)> = Vec::new();
         for p in paths {
@@ -179,7 +190,7 @@ impl Store {
                     report.files_skip += 1;
                     report.errors.push(format!("{}: {msg}", abs.display()));
                 }
-                ImportClass::Doc => match self.import_one(&abs, &rel) {
+                ImportClass::Doc => match self.import_one(&abs, &rel, opts) {
                     Ok(ImportOne::Skip) => report.files_skip += 1,
                     Ok(ImportOne::Done { chunks, unmatched }) => {
                         report.files_ok += 1;
@@ -196,7 +207,7 @@ impl Store {
         Ok(report)
     }
 
-    fn import_one(&mut self, path: &Path, rel_path: &str) -> Result<ImportOne> {
+    fn import_one(&mut self, path: &Path, rel_path: &str, opts: ImportOpts<'_>) -> Result<ImportOne> {
         let bytes = fs::read(path)?;
         let file_hash = sha256_file_hex(&bytes);
         let file_name = path
@@ -239,7 +250,7 @@ impl Store {
         }
 
         if let Some((_, h)) = &existing {
-            if h == &file_hash {
+            if h == &file_hash && !opts.reprocess {
                 return Ok(ImportOne::Skip);
             }
         }
@@ -249,7 +260,14 @@ impl Store {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| file_name.clone());
-        let mut drafts = blocks_to_drafts(&blocks, &stem);
+        let mut drafts = {
+            let (d, notes) = refine_drafts(&blocks, &stem, opts.splitter);
+            for n in notes {
+                // 拆条失败不中断；调用方可在导入报告里看到
+                let _ = n;
+            }
+            d
+        };
 
         let tx = self.conn.unchecked_transaction()?;
 
