@@ -10,16 +10,20 @@ impl EntrySplitter for MockSplitter {
                 aliases: vec!["猎人公会".into()],
                 entity_type: "faction".into(),
                 body: "驻扎熔炉区。".into(),
-                heading_level: 2,
                 anchor: String::new(),
+                start: -1,
+                end: -1,
+                heading_level: 2,
             },
             ExtractedEntry {
                 title: "登记员".into(),
                 aliases: vec![],
                 entity_type: "npc".into(),
                 body: "每天统计伤亡。".into(),
-                heading_level: 2,
                 anchor: String::new(),
+                start: -1,
+                end: -1,
+                heading_level: 2,
             },
         ])
     }
@@ -53,4 +57,21 @@ fn parse_fenced_ok() {
     )
     .unwrap();
     assert_eq!(v[0].title, "格里姆");
+}
+
+#[test]
+fn parse_segment_index_contract() {
+    let v = parse_entries_json(
+        r#"{"entries":[
+            {"title":"猎人工会","entity_type":"faction","aliases":["猎人公会"],"start":0,"end":1},
+            {"title":"登记员","entity_type":"npc","start":"002","end":"[003]"}
+        ]}"#,
+    )
+    .unwrap();
+    assert_eq!(v.len(), 2);
+    assert_eq!(v[0].start, 0);
+    assert_eq!(v[0].end, 1);
+    // 字符串段号（含 [nnn] 装饰）也能解析
+    assert_eq!(v[1].start, 2);
+    assert_eq!(v[1].end, 3);
 }
