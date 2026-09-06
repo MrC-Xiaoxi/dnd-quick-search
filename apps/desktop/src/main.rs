@@ -251,6 +251,14 @@ impl App {
                     if cfg.llm.concurrency > 0 {
                         c.concurrency = cfg.llm.concurrency;
                     }
+                    if cfg.llm.max_tokens > 0 {
+                        c.max_tokens = cfg.llm.max_tokens;
+                    }
+                    if cfg.llm.temperature > 0.0 {
+                        c.temperature = cfg.llm.temperature;
+                    }
+                    c.retries = cfg.llm.retries;
+                    c.json_mode = cfg.llm.json_mode;
                     Some(c)
                 }
                 None => {
@@ -327,6 +335,14 @@ impl App {
                         if !r.errors.is_empty() {
                             s.push_str(" · ");
                             s.push_str(&r.errors.join("；"));
+                        }
+                        if !r.warnings.is_empty() {
+                            let mut w = r.warnings.join("；");
+                            if w.chars().count() > 200 {
+                                w = w.chars().take(200).collect::<String>() + "…";
+                            }
+                            s.push_str(" · ");
+                            s.push_str(&w);
                         }
                         s
                     }
@@ -846,6 +862,17 @@ struct LlmSection {
     timeout_secs: u64,
     #[serde(default)]
     concurrency: u32,
+    #[serde(default)]
+    max_tokens: u32,
+    /// 0 表示用内置默认 0.1。
+    #[serde(default)]
+    temperature: f32,
+    /// 解析/调用失败后的追加重试次数（带错误回喂），0 表示一次定生死。
+    #[serde(default)]
+    retries: u32,
+    /// 请求 response_format=json_object；代理不支持时自动回退。
+    #[serde(default)]
+    json_mode: bool,
 }
 
 fn demo_root() -> PathBuf {
@@ -904,6 +931,7 @@ fn load_app_config() -> AppConfig {
                     model: "gpt-4o-mini".into(),
                     timeout_secs: 60,
                     concurrency: 3,
+                    ..Default::default()
                 },
             };
             save_app_config(&cfg);
@@ -924,14 +952,20 @@ fn save_app_config(cfg: &AppConfig) {
         llm.timeout_secs
     };
     let conc = if llm.concurrency == 0 { 3 } else { llm.concurrency };
+    let max_tokens = if llm.max_tokens == 0 { 2048 } else { llm.max_tokens };
+    let temp = if llm.temperature <= 0.0 { 0.1 } else { llm.temperature };
     let text = format!(
-        "# 席间索 AI 配置（仅导入拆条；查询走本地）\n# 拆条请用小模型（如 gpt-4o-mini），不要用 grok-4.6 这类推理模型。\nenabled = {}\nbase_url = \"{}\"\napi_key = \"{}\"\nmodel = \"{}\"\ntimeout_secs = {}\nconcurrency = {}\n",
+        "# 席间索 AI 配置（仅导入拆条；查询走本地）\n# 拆条请用小模型（如 gpt-4o-mini），不要用 grok-4.6 这类推理模型。\nenabled = {}\nbase_url = \"{}\"\napi_key = \"{}\"\nmodel = \"{}\"\ntimeout_secs = {}\nconcurrency = {}\nmax_tokens = {}\ntemperature = {}\nretries = {}\njson_mode = {}\n",
         llm.enabled,
         llm.base_url.replace('\\', "\\\\").replace('"', "\\\""),
         llm.api_key.replace('\\', "\\\\").replace('"', "\\\""),
         llm.model.replace('\\', "\\\\").replace('"', "\\\""),
         timeout,
-        conc
+        conc,
+        max_tokens,
+        temp,
+        llm.retries,
+        llm.json_mode
     );
     let _ = fs::write(path, text);
 }

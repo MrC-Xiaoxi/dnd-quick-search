@@ -192,10 +192,15 @@ impl Store {
                 }
                 ImportClass::Doc => match self.import_one(&abs, &rel, opts) {
                     Ok(ImportOne::Skip) => report.files_skip += 1,
-                    Ok(ImportOne::Done { chunks, unmatched }) => {
+                    Ok(ImportOne::Done {
+                        chunks,
+                        unmatched,
+                        notes,
+                    }) => {
                         report.files_ok += 1;
                         report.chunks += chunks;
                         report.unmatched_corrections += unmatched;
+                        report.warnings.extend(notes);
                     }
                     Err(e) => {
                         report.files_fail += 1;
@@ -260,14 +265,7 @@ impl Store {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| file_name.clone());
-        let mut drafts = {
-            let (d, notes) = refine_drafts(&blocks, &stem, opts.splitter);
-            for n in notes {
-                // 拆条失败不中断；调用方可在导入报告里看到
-                let _ = n;
-            }
-            d
-        };
+        let (mut drafts, notes) = refine_drafts(&blocks, &stem, opts.splitter);
 
         let tx = self.conn.unchecked_transaction()?;
 
@@ -375,6 +373,7 @@ impl Store {
         Ok(ImportOne::Done {
             chunks: n,
             unmatched,
+            notes,
         })
     }
 
@@ -507,7 +506,12 @@ impl Store {
 
 enum ImportOne {
     Skip,
-    Done { chunks: usize, unmatched: usize },
+    Done {
+        chunks: usize,
+        unmatched: usize,
+        /// 拆条阶段的非致命警告（失败回退、切点贴不回等）。
+        notes: Vec<String>,
+    },
 }
 
 enum ImportClass {

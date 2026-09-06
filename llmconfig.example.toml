@@ -8,3 +8,12 @@ api_key = "123456987"
 model = "gpt-4o-mini"
 timeout_secs = 60
 concurrency = 3
+
+# 单次对话的输出上限（token），0 用默认 2048
+max_tokens = 2048
+# 采样温度，0 用默认 0.1（拆条要稳定，别调高）
+temperature = 0.1
+# 解析/调用失败后的追加重试次数，重试会把上次错误回喂给模型；0 表示一次定生死
+retries = 1
+# 请求 response_format=json_object；代理或模型不支持（4xx）时自动去掉重发
+json_mode = false
