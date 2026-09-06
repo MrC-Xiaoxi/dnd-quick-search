@@ -12,3 +12,9 @@ version = "0.1.0"
 
 [workspace.dependencies]
 table-canon-core = { path = "crates/table-canon-core" }
+
+# 发布包优化：体积与运行性能（打包脚本 package-release.ps1 会再叠加 crt-static）
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

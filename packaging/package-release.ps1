@@ -1,0 +1,68 @@
+﻿﻿# 席间索 Windows 发布打包脚本
+# 用法: powershell -NoProfile -ExecutionPolicy Bypass -File packaging\package-release.ps1
+# 产物: dist\席间索-v<版本>-win64.zip（解压即用；内含安装/卸载脚本）
+# 说明:
+#   - 构建叠加 crt-static，exe 自带 C 运行时，目标机器无需安装 VC++ Redist
+#   - packaging/*.bat 为 GBK+CRLF、*.txt/*.ps1 为 UTF8-BOM（cmd 与 PowerShell 5.1 解析中文所必需）
+#     转换是幂等的：只把「有效的 UTF-8」源文件转成目标编码，已转换过的自动跳过
+
+$ErrorActionPreference = "Stop"
+$root = Split-Path -Parent $PSScriptRoot
+
+$gbk = [Text.Encoding]::GetEncoding(936)
+$utf8bom = New-Object Text.UTF8Encoding $true
+function Convert-Text([string]$rel, [bool]$bom) {
+    $p = Join-Path $root $rel
+    $strict = New-Object Text.UTF8Encoding -ArgumentList $false, $true  # 非法 UTF-8 字节即抛异常
+    try {
+        $text = $strict.GetString([IO.File]::ReadAllBytes($p)) -replace "(?<!`r)`n", "`r`n"
+        [IO.File]::WriteAllText($p, $text, $(if ($bom) { $utf8bom } else { $gbk }))
+        Write-Host "  编码转换: $rel"
+    } catch {
+        Write-Host "  已是目标编码，跳过: $rel"
+    }
+}
+
+# 1) 编码规范化（幂等）
+Write-Host "== 编码规范化 =="
+Convert-Text "packaging\安装席间索.bat" $false
+Convert-Text "packaging\卸载席间索.bat" $false
+Convert-Text "packaging\使用说明.txt" $true
+Convert-Text "packaging\package-release.ps1" $true
+
+# 读取版本号（apps/desktop/Cargo.toml）
+$crate = Get-Content (Join-Path $root "apps\desktop\Cargo.toml") -Raw -Encoding UTF8
+$ver = if ($crate -match '(?m)^\s*version\s*=\s*"([^"]+)"') { $Matches[1] } else { "0.1.0" }
+Write-Host "== 席间索 发布打包 v$ver =="
+
+# 2) 静态 CRT release 构建
+Push-Location $root
+try {
+    $env:RUSTFLAGS = "-C target-feature=+crt-static"
+    Write-Host "== cargo build --release（含 lto，约 1-3 分钟）=="
+    cargo build --release -p table-canon-desktop
+    if ($LASTEXITCODE -ne 0) { throw "cargo build 失败" }
+    Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue
+
+    # 3) 组装发布目录
+    $stage = Join-Path $root "dist\席间索-v$ver"
+    if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+    New-Item -ItemType Directory -Force -Path (Join-Path $stage "testdata") | Out-Null
+    Copy-Item "target\release\table-canon-desktop.exe" (Join-Path $stage "席间索.exe")
+    Copy-Item "llmconfig.example.toml" $stage
+    Copy-Item "packaging\安装席间索.bat" $stage
+    Copy-Item "packaging\卸载席间索.bat" $stage
+    Copy-Item "packaging\使用说明.txt" $stage
+    Copy-Item "testdata\sample-campaign" (Join-Path $stage "testdata\sample-campaign") -Recurse -Force
+    Copy-Item "README.md" $stage -ErrorAction SilentlyContinue
+
+    # 4) 压缩
+    $zip = Join-Path $root "dist\席间索-v$ver-win64.zip"
+    if (Test-Path $zip) { Remove-Item -Force $zip }
+    Compress-Archive -Path $stage -DestinationPath $zip
+
+    $mb = "{0:N1}" -f ((Get-Item $zip).Length / 1MB)
+    Write-Host "== 打包完成 =="
+    Write-Host "  目录: $stage"
+    Write-Host "  压缩包: $zip ($mb MB)"
+} finally { Pop-Location }

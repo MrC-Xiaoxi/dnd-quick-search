@@ -1,3 +1,6 @@
+// 发布版隐藏 Windows 控制台窗口；debug 保留方便看日志
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use eframe::egui::{
     self, text::LayoutJob, Color32, FontData, FontDefinitions, FontFamily, FontId, RichText,
     TextFormat, ViewportBuilder,
