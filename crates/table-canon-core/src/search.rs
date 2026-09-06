@@ -1,7 +1,7 @@
 use crate::db::{load_chunk, load_synonyms};
 use crate::normalize::{hanzi_count, now_rfc3339};
 use crate::terms::{extract_terms, extract_terms_relaxed, unescape_fts_term};
-use crate::types::{Hit, SearchResult};
+use crate::types::{Chunk, Hit, SearchResult};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
@@ -37,33 +37,37 @@ pub fn search(conn: &Connection, campaign_id: i64, q: SearchQuery<'_>) -> Result
     terms.sort();
     terms.dedup();
 
+    let (hanzi_terms, pinyin_terms): (Vec<_>, Vec<_>) = terms.iter().cloned().partition(|t| {
+        unescape_fts_term(t)
+            .chars()
+            .any(crate::normalize::is_hanzi)
+    });
+
     let mut ranks: HashMap<i64, (f64, Vec<String>)> = HashMap::new();
 
-    if !terms.is_empty() && !timed_out(started) {
-        run_fts(conn, campaign_id, &terms, 50, &mut ranks);
+    if !hanzi_terms.is_empty() && !timed_out(started) {
+        run_fts(conn, campaign_id, &hanzi_terms, 50, &mut ranks);
     }
 
     if ranks.len() < 3 && has_long_hanzi_run(&q0) && !timed_out(started) {
-        let relaxed = extract_terms_relaxed(&q0);
+        let relaxed: Vec<String> = extract_terms_relaxed(&q0)
+            .into_iter()
+            .filter(|t| {
+                unescape_fts_term(t)
+                    .chars()
+                    .any(crate::normalize::is_hanzi)
+            })
+            .collect();
         run_fts(conn, campaign_id, &relaxed, 50, &mut ranks);
     }
 
     let qn = crate::normalize::normalize(&q0);
-    if hanzi_count(&qn) <= 4 && !qn.is_empty() && !timed_out(started) {
-        let like = format!("%{}%", escape_like(&qn));
-        let mut stmt = conn.prepare(
-            "SELECT id FROM chunks
-             WHERE campaign_id=?1 AND (title LIKE ?2 ESCAPE '\\' OR aliases_json LIKE ?2 ESCAPE '\\')
-             LIMIT 30",
-        )?;
-        let ids: rusqlite::Result<Vec<i64>> = stmt
-            .query_map(params![campaign_id, like], |r| r.get::<_, i64>(0))
-            .and_then(|rows| rows.collect());
-        if let Ok(ids) = ids {
-            for (i, id) in ids.into_iter().enumerate() {
-                add_rank(&mut ranks, id, i, 0.7, "like");
-            }
-        }
+    if hanzi_count(&qn) >= 1 && hanzi_count(&qn) <= 4 && !timed_out(started) {
+        like_scan(conn, campaign_id, &qn, &mut ranks);
+    }
+
+    if ranks.len() < 3 && !pinyin_terms.is_empty() && !timed_out(started) {
+        run_fts(conn, campaign_id, &pinyin_terms, 30, &mut ranks);
     }
 
     let mut scored: Vec<(i64, f64, Vec<String>)> =
@@ -85,6 +89,7 @@ pub fn search(conn: &Connection, campaign_id: i64, q: SearchQuery<'_>) -> Result
             if !seen_title.insert(key) {
                 continue;
             }
+            let score = score + contains_boost(&chunk, &qn);
             hits.push(Hit { chunk, score, via });
         }
     }
@@ -110,13 +115,71 @@ pub fn search(conn: &Connection, campaign_id: i64, q: SearchQuery<'_>) -> Result
         [campaign_id],
     );
 
+    let shown_terms = if hanzi_terms.is_empty() {
+        terms
+    } else {
+        hanzi_terms
+    };
+
     Ok(SearchResult {
         hits,
         latency_ms,
         used_semantic: false,
         truncated: latency_ms >= HARD_TIMEOUT_MS,
-        terms,
+        terms: shown_terms,
     })
+}
+
+fn contains_boost(chunk: &Chunk, q: &str) -> f64 {
+    if q.is_empty() {
+        return 0.0;
+    }
+    let title = crate::normalize::normalize(&chunk.title);
+    if title == *q {
+        return 12.0;
+    }
+    if title.contains(q) {
+        return 8.0;
+    }
+    if chunk
+        .aliases
+        .iter()
+        .any(|a| crate::normalize::normalize(a).contains(q))
+    {
+        return 6.0;
+    }
+    if crate::normalize::normalize(&chunk.body).contains(q) {
+        return 3.0;
+    }
+    0.0
+}
+
+fn like_scan(
+    conn: &Connection,
+    campaign_id: i64,
+    needle: &str,
+    ranks: &mut HashMap<i64, (f64, Vec<String>)>,
+) {
+    let like = format!("%{}%", escape_like(needle));
+    let sql = "SELECT id FROM chunks
+         WHERE campaign_id=?1 AND (
+            title LIKE ?2 ESCAPE '\\'
+            OR aliases_json LIKE ?2 ESCAPE '\\'
+            OR body LIKE ?2 ESCAPE '\\'
+         )
+         LIMIT 50";
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return;
+    };
+    let Ok(ids) = stmt
+        .query_map(params![campaign_id, like], |r| r.get::<_, i64>(0))
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<i64>>>())
+    else {
+        return;
+    };
+    for (i, id) in ids.into_iter().enumerate() {
+        add_rank(ranks, id, i, 1.2, "like");
+    }
 }
 
 fn timed_out(started: Instant) -> bool {
@@ -139,9 +202,7 @@ fn has_long_hanzi_run(q: &str) -> bool {
 }
 
 fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
 fn run_fts(

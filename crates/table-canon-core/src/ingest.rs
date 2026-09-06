@@ -386,7 +386,33 @@ fn paragraph_text(p: &str) -> String {
     for t in wt_re().captures_iter(&with_tab) {
         text.push_str(&decode_xml_entities(&t[1]));
     }
-    text
+    scrub_xml_leak(&text)
+}
+
+/// Word 偶发未闭合 <w:t> 会把 pPr/rFonts 整段吞进正文。检出后剥标签。
+fn scrub_xml_leak(s: &str) -> String {
+    if !s.contains('<') {
+        return s.to_string();
+    }
+    static TAG: OnceLock<Regex> = OnceLock::new();
+    let re = TAG.get_or_init(|| Regex::new(r"(?s)<[^>]+>").expect("xml tag re"));
+    let stripped = re.replace_all(s, " ");
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn looks_like_heading_text(text: &str) -> Option<u8> {
+    let t = text.trim();
+    let n = t.chars().count();
+    if n == 0 || n > 32 {
+        return None;
+    }
+    if t.contains('<') {
+        return None;
+    }
+    if t.starts_with('第') && (t.contains('章') || t.contains('节') || t.contains('回')) {
+        return Some(1);
+    }
+    None
 }
 
 fn xml_escape(s: &str) -> String {
@@ -456,7 +482,8 @@ fn blocks_from_docx_xml(xml: &str) -> Vec<Block> {
     for cap in para_re().captures_iter(&xml) {
         let p = &cap[1];
         let trimmed = paragraph_text(p).trim().to_string();
-        if let Some(level) = heading_level_from_p(p) {
+        let heading = heading_level_from_p(p).or_else(|| looks_like_heading_text(&trimmed));
+        if let Some(level) = heading {
             flush(&mut blocks, &cur_title, cur_level, &mut buf);
             cur_title = if trimmed.is_empty() {
                 "未命名".into()
@@ -799,5 +826,21 @@ mod tests {
             "{:?}",
             blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn docx_unclosed_wt_does_not_leak_ppr() {
+        let inner = r#"<w:pPr><w:pBdr><w:left w:val="none" w:sz="0"/></w:pBdr><w:rPr><w:rFonts w:ascii="华文中宋"/></w:rPr></w:pPr><w:r><w:t>第1章 接受任务"#;
+        // 故意不闭合第一个 w:t，模拟吞进 rFonts 的文档
+        let leaked = format!("{inner}</w:t></w:r></w:p>");
+        let text = paragraph_text(&leaked);
+        assert!(!text.contains("<w:"), "{text}");
+        assert!(text.contains("第1章") || text.contains("接受任务"), "{text}");
+    }
+
+    #[test]
+    fn chapter_line_is_heading() {
+        assert_eq!(looks_like_heading_text("第1章 接受任务"), Some(1));
+        assert_eq!(looks_like_heading_text("猎人工会的登记员在统计伤亡"), None);
     }
 }
