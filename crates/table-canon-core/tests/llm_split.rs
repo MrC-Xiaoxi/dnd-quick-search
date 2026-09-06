@@ -11,6 +11,7 @@ impl EntrySplitter for MockSplitter {
                 entity_type: "faction".into(),
                 body: "驻扎熔炉区。".into(),
                 heading_level: 2,
+                anchor: String::new(),
             },
             ExtractedEntry {
                 title: "登记员".into(),
@@ -18,6 +19,7 @@ impl EntrySplitter for MockSplitter {
                 entity_type: "npc".into(),
                 body: "每天统计伤亡。".into(),
                 heading_level: 2,
+                anchor: String::new(),
             },
         ])
     }

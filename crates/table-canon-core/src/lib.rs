@@ -11,5 +11,5 @@ pub mod types;
 
 pub use db::{ImportOpts, Store};
 pub use llm::{LlmConfig, LlmSplitter};
-pub use split::{parse_entries_json, EntrySplitter};
+pub use split::{materialize_entries, parse_entries_json, EntrySplitter};
 pub use types::*;

@@ -95,6 +95,9 @@ pub struct ExtractedEntry {
     pub entity_type: String,
     #[serde(default)]
     pub body: String,
+    /// 原文中连续出现的短句，框架用它定位切点；可空。
+    #[serde(default)]
+    pub anchor: String,
     #[serde(default)]
     pub heading_level: u8,
 }

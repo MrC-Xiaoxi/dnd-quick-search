@@ -120,7 +120,7 @@ impl LlmSplitter {
 
     fn cached_split(&self, title: &str, piece: &str, idx: usize) -> Result<Vec<ExtractedEntry>> {
         let user = format!("章节标题：{title}\n分段序号：{}\n正文：\n{piece}", idx + 1);
-        let key = sha1_hex(&format!("{}|{title}|{idx}|{piece}", self.cfg.model));
+        let key = sha1_hex(&format!("v2|{}|{title}|{idx}|{piece}", self.cfg.model));
         let path = cache_dir().join(format!("{key}.json"));
         if let Ok(raw) = fs::read_to_string(&path) {
             if let Ok(entries) = parse_entries_json(&raw) {
@@ -290,14 +290,19 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-const SYSTEM: &str = r#"你是跑团资料库归档员。把一章正文切成可检索条目。
+const SYSTEM: &str = r#"你是跑团资料库的切点标注员，不是作者。
 
-硬性规则：
-1. 只剪切原文，禁止扩写、禁止改写、禁止总结。body 必须是原文连续片段。
-2. 一条一个专名（NPC/地点/势力/物品/规则/线索）。标题用短专名，不要用「第N章」当标题。
-3. 别名含简称、英文、口头叫法。entity_type 只能是 npc location item faction rule plot，不确定就省略。
-4. 秘密原文单独成行，以【秘密】开头。
-5. 只输出 JSON 数组：[{"title":"...","aliases":["..."],"entity_type":"faction","body":"..."}]
+只提出切点，禁止输出正文，禁止扩写、改写、总结。
+
+按原文出现顺序输出 JSON 数组：
+[{"title":"短专名","aliases":["口头叫法"],"entity_type":"npc|location|item|faction|rule|plot","anchor":"原文里连续出现的 8 到 24 个字，必须原样复制"}]
+
+硬性：
+1. 不要输出 body。框架会按 anchor/title 从原文剪切。
+2. title 2–16 字，用专名；不要用「第N章」。
+3. entity_type 只能是 npc location item faction rule plot，不确定就省略。
+4. 宁可少切，不要把两个专名糊成一条。
+5. 只输出 JSON 数组。
 "#;
 
 #[derive(Deserialize)]
