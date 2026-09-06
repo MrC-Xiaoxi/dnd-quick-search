@@ -3,6 +3,7 @@ use crate::types::ExtractedEntry;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
@@ -31,11 +32,30 @@ impl LlmConfig {
 
 pub struct LlmSplitter {
     cfg: LlmConfig,
+    progress: Option<Arc<Mutex<String>>>,
 }
 
 impl LlmSplitter {
     pub fn new(cfg: LlmConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            progress: None,
+        }
+    }
+
+    pub fn with_progress(cfg: LlmConfig, progress: Arc<Mutex<String>>) -> Self {
+        Self {
+            cfg,
+            progress: Some(progress),
+        }
+    }
+
+    fn note(&self, msg: impl Into<String>) {
+        if let Some(p) = &self.progress {
+            if let Ok(mut g) = p.lock() {
+                *g = msg.into();
+            }
+        }
     }
 
     fn chat(&self, user: &str) -> Result<String> {
@@ -71,7 +91,19 @@ impl LlmSplitter {
 impl EntrySplitter for LlmSplitter {
     fn split_chapter(&self, chapter_title: &str, body: &str) -> Result<Vec<ExtractedEntry>> {
         let mut out = Vec::new();
-        for (i, piece) in split_for_context(body, 4500).into_iter().enumerate() {
+        let pieces = split_for_context(body, 4500);
+        let n = pieces.len();
+        for (i, piece) in pieces.into_iter().enumerate() {
+            self.note(format!(
+                "LLM 拆条「{}」({}/{})，窗口可继续点，请等本段返回…",
+                if chapter_title.is_empty() {
+                    "未命名"
+                } else {
+                    chapter_title
+                },
+                i + 1,
+                n
+            ));
             let user = format!(
                 "章节标题：{chapter_title}\n分段序号：{}\n正文：\n{piece}",
                 i + 1

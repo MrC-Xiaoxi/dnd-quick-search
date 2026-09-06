@@ -2,6 +2,9 @@ use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, RichTex
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use table_canon_core::{
     Hit, ImportOpts, LlmConfig, LlmSplitter, MetaPatch, SearchResult, Store, StoreInfo,
     VIS_PUBLIC, VIS_SECRET,
@@ -31,6 +34,16 @@ enum Pending {
     Import(Vec<PathBuf>),
 }
 
+struct ImportJob {
+    progress: Arc<Mutex<String>>,
+    rx: mpsc::Receiver<ImportOutcome>,
+}
+
+struct ImportOutcome {
+    store: Store,
+    result: Result<table_canon_core::ImportReport, String>,
+}
+
 struct App {
     store: Option<Store>,
     info: Option<StoreInfo>,
@@ -45,6 +58,7 @@ struct App {
     search_focused: bool,
     expanded: HashSet<i64>,
     llm_enabled: bool,
+    import_job: Option<ImportJob>,
 }
 
 impl App {
@@ -67,6 +81,7 @@ impl App {
             search_focused: false,
             expanded: HashSet::new(),
             llm_enabled: load_app_config().llm.enabled,
+            import_job: None,
         };
         if let Some(p) = load_last_store_path() {
             match Store::open(&p) {
@@ -107,6 +122,10 @@ impl App {
     fn do_search(&mut self) {
         let q = self.query.trim().to_string();
         if q.is_empty() {
+            return;
+        }
+        if self.import_job.is_some() {
+            self.status = "正在后台导入，请等拆条完成后再检索。".into();
             return;
         }
         let Some(s) = self.store.as_ref() else {
@@ -207,49 +226,113 @@ impl App {
     }
 
     fn import_selected(&mut self, paths: Vec<PathBuf>) {
-        let Some(s) = self.store.as_mut() else {
+        let Some(_s) = self.store.as_ref() else {
             self.status = "请先新建或打开库，再导入。".into();
             return;
         };
+        if self.import_job.is_some() {
+            self.status = "已有导入在后台进行，请等它结束。".into();
+            return;
+        }
         let cfg = load_app_config();
-        let splitter = if self.llm_enabled {
-            LlmConfig::from_parts(&cfg.llm.base_url, &cfg.llm.api_key, &cfg.llm.model).map(|mut c| {
-                if cfg.llm.timeout_secs > 0 {
-                    c.timeout_secs = cfg.llm.timeout_secs;
+        let llm_cfg = if self.llm_enabled {
+            match LlmConfig::from_parts(&cfg.llm.base_url, &cfg.llm.api_key, &cfg.llm.model) {
+                Some(mut c) => {
+                    if cfg.llm.timeout_secs > 0 {
+                        c.timeout_secs = cfg.llm.timeout_secs;
+                    }
+                    Some(c)
                 }
-                LlmSplitter::new(c)
-            })
+                None => {
+                    self.status = format!(
+                        "已勾选 LLM 拆条，但 {} 里 base_url / api_key / model 不完整。",
+                        llmconfig_path().display()
+                    );
+                    return;
+                }
+            }
         } else {
             None
         };
-        if self.llm_enabled && splitter.is_none() {
-            self.status = format!(
-                "已勾选 LLM 拆条，但 {} 里 base_url / api_key / model 不完整。",
-                llmconfig_path().display()
-            );
+        let Some(store) = self.store.take() else {
             return;
-        }
-        if splitter.is_some() {
-            self.status = "正在用 LLM 拆条，导入可能要几分钟，窗口会暂时无响应…".into();
-        }
-        let opts = ImportOpts {
-            splitter: splitter.as_ref().map(|x| x as &dyn table_canon_core::EntrySplitter),
-            reprocess: splitter.is_some(),
         };
-        match s.import_with(&paths, opts) {
-            Ok(r) => {
-                self.status = format!(
-                    "导入完成：成功 {} / 跳过 {} / 失败 {} / 条目 {} / 未挂修正 {}",
-                    r.files_ok, r.files_skip, r.files_fail, r.chunks, r.unmatched_corrections
-                );
-                if !r.errors.is_empty() {
-                    self.status.push_str(" · ");
-                    self.status.push_str(&r.errors.join("；"));
-                }
+        let progress = Arc::new(Mutex::new(
+            if llm_cfg.is_some() {
+                "后台导入 + LLM 拆条中，窗口应保持可点；请不要关程序。".to_string()
+            } else {
+                "后台导入中…".to_string()
+            },
+        ));
+        let (tx, rx) = mpsc::channel();
+        let progress_thread = progress.clone();
+        thread::spawn(move || {
+            let mut store = store;
+            let splitter = llm_cfg.map(|c| LlmSplitter::with_progress(c, progress_thread.clone()));
+            if let Ok(mut g) = progress_thread.lock() {
+                *g = if splitter.is_some() {
+                    "正在解析 Word 并用 LLM 拆条…".into()
+                } else {
+                    "正在解析并写入库…".into()
+                };
             }
-            Err(e) => self.status = format!("导入失败: {e}"),
+            let opts = ImportOpts {
+                splitter: splitter.as_ref().map(|x| x as &dyn table_canon_core::EntrySplitter),
+                reprocess: splitter.is_some(),
+            };
+            let result = store
+                .import_with(&paths, opts)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(ImportOutcome { store, result });
+        });
+        self.status = progress.lock().map(|g| g.clone()).unwrap_or_else(|_| "后台导入中…".into());
+        self.import_job = Some(ImportJob { progress, rx });
+    }
+
+    fn poll_import_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.import_job else {
+            return;
+        };
+        if let Ok(msg) = job.progress.lock() {
+            if !msg.is_empty() && *msg != self.status {
+                self.status = msg.clone();
+            }
         }
-        self.refresh_info();
+        let recv = job.rx.try_recv();
+        match recv {
+            Ok(out) => {
+                self.import_job = None;
+                remember_store(&out.store.path);
+                self.store = Some(out.store);
+                let import_msg = match out.result {
+                    Ok(r) => {
+                        let mut s = format!(
+                            "导入完成：成功 {} / 跳过 {} / 失败 {} / 条目 {} / 未挂修正 {}",
+                            r.files_ok,
+                            r.files_skip,
+                            r.files_fail,
+                            r.chunks,
+                            r.unmatched_corrections
+                        );
+                        if !r.errors.is_empty() {
+                            s.push_str(" · ");
+                            s.push_str(&r.errors.join("；"));
+                        }
+                        s
+                    }
+                    Err(e) => format!("导入失败: {e}"),
+                };
+                self.refresh_info();
+                self.status = import_msg;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.import_job = None;
+                self.status = "导入线程意外退出。请重新打开库后再试。".into();
+            }
+        }
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -274,6 +357,7 @@ impl eframe::App for App {
                 Pending::Import(paths) => self.import_selected(paths),
             }
         }
+        self.poll_import_job(ctx);
 
         let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         if enter && !self.search_focused && self.store.is_some() {
@@ -334,7 +418,7 @@ impl eframe::App for App {
                         }
                     }
                 }
-                ui.add_enabled_ui(self.store.is_some(), |ui| {
+                ui.add_enabled_ui(self.store.is_some() && self.import_job.is_none(), |ui| {
                     if ui.button("导入文件夹").clicked() {
                         if let Some(p) = rfd::FileDialog::new().pick_folder() {
                             self.status = format!("正在导入 {} …", p.display());
@@ -431,6 +515,15 @@ impl eframe::App for App {
             let hits: Vec<Hit> = self.last.as_ref().map(|l| l.hits.clone()).unwrap_or_default();
             let selected = self.selected;
             egui::ScrollArea::vertical().show(ui, |ui| {
+                if self.import_job.is_some() {
+                    ui.label(
+                        RichText::new("正在后台导入 / LLM 拆条。窗口应仍可拖动；底栏会显示当前章节。")
+                            .size(16.0),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&self.status).weak());
+                    return;
+                }
                 if self.store.is_none() {
                     ui.label(
                         RichText::new("这是开席用的设定检索小样：导入资料 → 对着玩家原话搜 → 复制公开版。")
