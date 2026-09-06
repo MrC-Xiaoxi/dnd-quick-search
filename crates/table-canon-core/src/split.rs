@@ -336,7 +336,59 @@ pub fn refine_drafts(
             }
         }
     }
+    merge_leadin_drafts(&mut drafts);
     (drafts, notes)
+}
+
+/// 导语条前并：正文很短且以冒号结尾的条目（「温度分层：……如下：」这类一句话导语），
+/// 其完整解释在下一条里，单独成条让用户光凭一句话看不到解释内容。
+/// 把它并入同章节的下一条（body 前置、标题转为别名），ordinals 重新连续编号。
+fn merge_leadin_drafts(drafts: &mut Vec<DraftChunk>) {
+    const LEADIN_MAX_CHARS: usize = 80;
+    let is_lead = |d: &DraftChunk| {
+        if d.body.chars().count() >= LEADIN_MAX_CHARS {
+            return false;
+        }
+        let body = d.body.trim_end();
+        if body.ends_with(':') || body.ends_with('：') {
+            return true;
+        }
+        // 标题带冒号而正文是列表首项的碎片（如「结算步骤：」+「1. …」）
+        let title = d.title.trim_end();
+        title.ends_with(':') || title.ends_with('：')
+    };
+    let mut i = 0usize;
+    while i + 1 < drafts.len() {
+        let lead = &drafts[i];
+        if is_lead(lead)
+            && chapter_prefix(&lead.parent_path) == chapter_prefix(&drafts[i + 1].parent_path)
+        {
+            let absorbed = lead.title.clone();
+            let lead_body = lead.body.clone();
+            let next = &mut drafts[i + 1];
+            next.body = format!("{lead_body}\n{}", next.body);
+            if !absorbed.is_empty()
+                && absorbed != next.title
+                && !next.aliases.contains(&absorbed)
+            {
+                next.aliases.insert(0, absorbed);
+            }
+            next.content_hash = sha1_body_hex(&next.body);
+            next.alt_anchor = alt_anchor(&next.parent_path, &next.body);
+            drafts.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    // ordinal 必须连续：阅读页按 ordinal±1 找上下文条目
+    for (k, d) in drafts.iter_mut().enumerate() {
+        d.ordinal = k as i64;
+    }
+}
+
+/// parent_path 去掉末段标题后的章节前缀："stem / 章 / 条" → "stem / 章"。
+fn chapter_prefix(parent_path: &str) -> &str {
+    parent_path.rsplit_once(" / ").map_or("", |(p, _)| p)
 }
 
 fn coalesce_same_title(blocks: &[Block]) -> Vec<Block> {
@@ -936,5 +988,49 @@ mod tests {
         let v = parse_entries_json(raw).unwrap();
         assert_eq!(v[0].title, "格里姆");
         assert_eq!(v[0].start, 2);
+    }
+
+    #[test]
+    fn leadin_draft_merges_into_next_within_same_chapter() {
+        // 还原真实案例：温度分层(27字导语，冒号结尾) / 霜顶区(完整解释)
+        let blocks = vec![
+            Block {
+                heading_level: 2,
+                title: "温度分层".into(),
+                text: "终燃城由三层构成，温度随深度递增，生存难度随高度递增：".into(),
+            },
+            Block {
+                heading_level: 2,
+                title: "霜顶区（最上层）".into(),
+                text: "• 基础温度：极寒，零下30度至零下50度\n• 环境描述：永冻荒原，狂风呼啸，暴露在外的皮肤会在几分钟内冻伤。".into(),
+            },
+        ];
+        let (drafts, _) = refine_drafts(&blocks, "罪业之潮", None);
+        assert_eq!(drafts.len(), 1, "导语条应并入下一条");
+        assert_eq!(drafts[0].title, "霜顶区（最上层）");
+        assert!(drafts[0].body.starts_with("终燃城由三层构成"));
+        assert!(drafts[0].aliases.contains(&"温度分层".to_string()));
+        // ordinal 重新连续，阅读页按 ordinal±1 才能找到上下文
+        assert_eq!(drafts[0].ordinal, 0);
+    }
+
+    #[test]
+    fn complete_short_entry_and_cross_chapter_lead_are_kept() {
+        // 完整短条目（句号结尾）不算导语，不能被吞
+        let blocks = vec![
+            Block {
+                heading_level: 2,
+                title: "终燃城".into(),
+                text: "终燃城是一座倒置的坟墓，深入山骸与地壳，温暖既是生存必须品，更是流通的货币。".into(),
+            },
+            Block {
+                heading_level: 2,
+                title: "暖廊".into(),
+                text: "连接三层的恒温通道，每半小时巡逻一次。".into(),
+            },
+        ];
+        let (drafts, _) = refine_drafts(&blocks, "罪业之潮", None);
+        assert_eq!(drafts.len(), 2);
+        assert_eq!(drafts[0].title, "终燃城");
     }
 }
