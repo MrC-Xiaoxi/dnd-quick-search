@@ -7,6 +7,8 @@
 *.tcs-shm
 *.tcs-journal
 config.toml
+llmconfig.toml
+llmconfig
 .DS_Store
 Thumbs.db
 node_modules/

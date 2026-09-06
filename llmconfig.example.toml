@@ -1,0 +1,8 @@
+# 席间索 AI 配置模板
+# 复制为同目录 llmconfig.toml 后填写。查询不走网络。
+
+enabled = false
+base_url = "http://127.0.0.1:8317/v1"
+api_key = "123456987"
+model = "gpt-4o-mini"
+timeout_secs = 180

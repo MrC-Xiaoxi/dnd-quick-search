@@ -213,14 +213,20 @@ impl App {
         };
         let cfg = load_app_config();
         let splitter = if self.llm_enabled {
-            LlmConfig::from_parts(&cfg.llm.base_url, &cfg.llm.api_key, &cfg.llm.model)
-                .map(LlmSplitter::new)
+            LlmConfig::from_parts(&cfg.llm.base_url, &cfg.llm.api_key, &cfg.llm.model).map(|mut c| {
+                if cfg.llm.timeout_secs > 0 {
+                    c.timeout_secs = cfg.llm.timeout_secs;
+                }
+                LlmSplitter::new(c)
+            })
         } else {
             None
         };
         if self.llm_enabled && splitter.is_none() {
-            self.status =
-                "已勾选 LLM 拆条，但 config.toml 里 base_url / api_key / model 不完整。请先填好再导入。".into();
+            self.status = format!(
+                "已勾选 LLM 拆条，但 {} 里 base_url / api_key / model 不完整。",
+                llmconfig_path().display()
+            );
             return;
         }
         if splitter.is_some() {
@@ -348,7 +354,7 @@ impl eframe::App for App {
                     }
                     if ui
                         .checkbox(&mut self.llm_enabled, "导入时 LLM 拆条")
-                        .on_hover_text("导入可变慢，查询仍在本地 5 秒内。密钥写在 %APPDATA%\\table-canon\\config.toml")
+                        .on_hover_text("导入可变慢，查询仍在本地 5 秒内。密钥写在仓库根目录 llmconfig.toml")
                         .changed()
                     {
                         let mut c = load_app_config();
@@ -565,7 +571,7 @@ struct AppConfig {
     llm: LlmSection,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
 struct LlmSection {
     #[serde(default)]
     enabled: bool,
@@ -575,18 +581,67 @@ struct LlmSection {
     api_key: String,
     #[serde(default)]
     model: String,
+    #[serde(default)]
+    timeout_secs: u64,
 }
 
-fn config_path() -> PathBuf {
-    appdata_dir().join("config.toml")
+fn demo_root() -> PathBuf {
+    let from_crate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    if from_crate.join("Cargo.toml").is_file() {
+        return from_crate.canonicalize().unwrap_or(from_crate);
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn llmconfig_candidates() -> Vec<PathBuf> {
+    let root = demo_root();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| root.clone());
+    vec![
+        root.join("llmconfig.toml"),
+        root.join("llmconfig"),
+        cwd.join("llmconfig.toml"),
+        cwd.join("llmconfig"),
+    ]
+}
+
+fn llmconfig_path() -> PathBuf {
+    llmconfig_candidates()
+        .into_iter()
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| demo_root().join("llmconfig.toml"))
+}
+
+fn parse_llm_file(raw: &str) -> LlmSection {
+    if let Ok(flat) = toml::from_str::<LlmSection>(raw) {
+        if flat.enabled
+            || !flat.base_url.trim().is_empty()
+            || !flat.api_key.trim().is_empty()
+            || !flat.model.trim().is_empty()
+        {
+            return flat;
+        }
+    }
+    toml::from_str::<AppConfig>(raw)
+        .map(|c| c.llm)
+        .unwrap_or_default()
 }
 
 fn load_app_config() -> AppConfig {
-    let p = config_path();
+    let p = llmconfig_path();
     match fs::read_to_string(&p) {
-        Ok(raw) => toml::from_str(&raw).unwrap_or_default(),
+        Ok(raw) => AppConfig {
+            llm: parse_llm_file(&raw),
+        },
         Err(_) => {
-            let cfg = AppConfig::default();
+            let cfg = AppConfig {
+                llm: LlmSection {
+                    enabled: false,
+                    base_url: "http://127.0.0.1:8317/v1".into(),
+                    api_key: String::new(),
+                    model: "gpt-4o-mini".into(),
+                    timeout_secs: 180,
+                },
+            };
             save_app_config(&cfg);
             cfg
         }
@@ -594,10 +649,25 @@ fn load_app_config() -> AppConfig {
 }
 
 fn save_app_config(cfg: &AppConfig) {
-    let _ = fs::create_dir_all(appdata_dir());
-    if let Ok(text) = toml::to_string_pretty(cfg) {
-        let _ = fs::write(config_path(), text);
+    let path = llmconfig_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
     }
+    let llm = &cfg.llm;
+    let timeout = if llm.timeout_secs == 0 {
+        180
+    } else {
+        llm.timeout_secs
+    };
+    let text = format!(
+        "# 席间索 AI 配置（仅导入拆条；查询走本地）\nenabled = {}\nbase_url = \"{}\"\napi_key = \"{}\"\nmodel = \"{}\"\ntimeout_secs = {}\n",
+        llm.enabled,
+        llm.base_url.replace('\\', "\\\\").replace('"', "\\\""),
+        llm.api_key.replace('\\', "\\\\").replace('"', "\\\""),
+        llm.model.replace('\\', "\\\\").replace('"', "\\\""),
+        timeout
+    );
+    let _ = fs::write(path, text);
 }
 
 fn appdata_dir() -> PathBuf {

@@ -47,8 +47,8 @@ cargo run -p table-canon-desktop --release
 
 导入可以花任意时间处理；查询始终本地、5 秒内返回。开启后，导入时用 OpenAI 兼容 API 把每章拆成「一条一卡」（像 5E 不全书那样标题可直接命中），失败则退回规则切块。
 
-1. 把 `apps/desktop/config.example.toml` 抄到 `%APPDATA%\table-canon\config.toml`，填 `base_url` / `api_key` / `model`（本机 EasyCLIProxyAPI 默认 `http://127.0.0.1:8317/v1` + `123456987`）。
-2. 界面勾选「导入时 LLM 拆条」，再点导入。同一文件会强制重拆。
+1. 编辑仓库根目录 `llmconfig.toml`（可从 `llmconfig.example.toml` 复制），填 `base_url` / `api_key` / `model`。本机 EasyCLIProxyAPI 默认 `http://127.0.0.1:8317/v1`。
+2. 界面勾选「导入时 LLM 拆条」，再点导入。同一文件会强制重拆。`llmconfig.toml` 已 gitignore，不要把真实 Key 提交上去。
 
 ## 许可
 
