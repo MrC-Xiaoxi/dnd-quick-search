@@ -6,7 +6,7 @@ pub const VIS_SECRET: i64 = 4;
 pub const VIS_HIDDEN: i64 = 8;
 
 pub const APP_ID: i64 = 0x5443_5331; // TCS1
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreInfo {

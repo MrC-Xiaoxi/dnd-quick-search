@@ -1,0 +1,30 @@
+{"query": "我们之前在那个独眼酒保的店里拿到了货", "relevant_chunk_ids": ["格里姆（独眼酒保）"], "kind": "lexical", "must_extract_any": ["独眼酒保"]}
+{"query": "独眼酒保", "relevant_chunk_ids": ["格里姆（独眼酒保）"], "kind": "lexical", "must_extract_any": ["独眼酒保"]}
+{"query": "格里姆", "relevant_chunk_ids": ["格里姆（独眼酒保）"], "kind": "lexical", "must_extract_any": ["格里姆"]}
+{"query": "老格", "relevant_chunk_ids": ["格里姆（独眼酒保）"], "kind": "lexical", "must_extract_any": []}
+{"query": "gelimu", "relevant_chunk_ids": ["格里姆（独眼酒保）"], "kind": "lexical", "must_extract_any": ["gelimu"]}
+{"query": "ge li mu", "relevant_chunk_ids": ["格里姆（独眼酒保）"], "kind": "lexical", "must_extract_any": ["gelimu"]}
+{"query": "glm", "relevant_chunk_ids": ["格里姆（独眼酒保）"], "kind": "lexical", "must_extract_any": ["glm"]}
+{"query": "断桅酒馆", "relevant_chunk_ids": ["断桅酒馆"], "kind": "lexical", "must_extract_any": ["断桅酒馆"]}
+{"query": "斷桅酒館", "relevant_chunk_ids": ["断桅酒馆"], "kind": "lexical", "must_extract_any": ["断桅酒馆"]}
+{"query": "潮响号", "relevant_chunk_ids": ["潮响号"], "kind": "lexical", "must_extract_any": ["潮响号"]}
+{"query": "三号泊位", "relevant_chunk_ids": ["潮响号"], "kind": "lexical", "must_extract_any": ["三号泊位"]}
+{"query": "入港税", "relevant_chunk_ids": ["断桅港"], "kind": "lexical", "must_extract_any": ["入港税"]}
+{"query": "城门守卫", "relevant_chunk_ids": ["断桅港"], "kind": "lexical", "must_extract_any": ["城门守卫"]}
+{"query": "公会徽记", "relevant_chunk_ids": ["断桅港"], "kind": "lexical", "must_extract_any": ["公会徽记"]}
+{"query": "湿咸的风", "relevant_chunk_ids": ["断桅港"], "kind": "lexical", "must_extract_any": ["湿咸的风"]}
+{"query": "修帆工", "relevant_chunk_ids": ["断桅酒馆"], "kind": "lexical", "must_extract_any": ["修帆工"]}
+{"query": "双桅商船", "relevant_chunk_ids": ["潮响号"], "kind": "lexical", "must_extract_any": ["双桅商船"]}
+{"query": "后厨门", "relevant_chunk_ids": ["格里姆（独眼酒保）"], "kind": "lexical", "must_extract_any": ["后厨门"]}
+{"query": "旧银币", "relevant_chunk_ids": ["格里姆（独眼酒保）"], "kind": "lexical", "must_extract_any": ["旧银币"]}
+{"query": "底舱改装", "relevant_chunk_ids": ["潮响号"], "kind": "lexical", "must_extract_any": ["底舱改装"]}
+{"query": "一楼卖劣酒", "relevant_chunk_ids": ["断桅酒馆"], "kind": "lexical", "must_extract_any": ["一楼卖劣酒"]}
+{"query": "二楼有三个包间", "relevant_chunk_ids": ["断桅酒馆"], "kind": "lexical", "must_extract_any": ["三个包间"]}
+{"query": "潮响号底舱", "relevant_chunk_ids": ["格里姆（独眼酒保）", "潮响号"], "kind": "lexical", "must_extract_any": ["潮响号"]}
+{"query": "duyanjiubao", "relevant_chunk_ids": ["格里姆（独眼酒保）"], "kind": "lexical", "must_extract_any": ["duyanjiubao"]}
+{"query": "dyjb", "relevant_chunk_ids": ["格里姆（独眼酒保）"], "kind": "lexical", "must_extract_any": ["dyjb"]}
+{"query": "断桅港", "relevant_chunk_ids": ["断桅港"], "kind": "lexical", "must_extract_any": ["断桅港"]}
+{"query": "走私和修船", "relevant_chunk_ids": ["断桅港"], "kind": "lexical", "must_extract_any": ["走私和修船"]}
+{"query": "玩家会从港口进城", "relevant_chunk_ids": ["战役简介"], "kind": "lexical", "must_extract_any": ["港口进城"]}
+{"query": "那个独眼酒保", "relevant_chunk_ids": ["格里姆（独眼酒保）", "战役简介"], "kind": "lexical", "must_extract_any": ["独眼酒保"]}
+{"query": "AND 格里姆", "relevant_chunk_ids": ["格里姆（独眼酒保）"], "kind": "lexical", "must_extract_any": ["格里姆"]}

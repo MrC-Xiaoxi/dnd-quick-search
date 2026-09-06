@@ -1,4 +1,4 @@
-use crate::ingest::{blocks_to_drafts, build_search_text, parse_file};
+use crate::ingest::{blocks_to_drafts, build_search_text, is_secret_markup_line, parse_file};
 use crate::normalize::{now_rfc3339, sha256_file_hex};
 use crate::search::{self, SearchQuery};
 use crate::types::*;
@@ -21,7 +21,12 @@ impl Store {
             fs::create_dir_all(parent)?;
         }
         if path.exists() {
-            bail!("文件已存在: {}", path.display());
+            let len = fs::metadata(&path)?.len();
+            if len == 0 {
+                fs::remove_file(&path)?;
+            } else {
+                bail!("文件已存在: {}", path.display());
+            }
         }
         let conn = Connection::open(&path)?;
         configure_new(&conn)?;
@@ -46,6 +51,15 @@ impl Store {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, true)
+    }
+
+    /// 打开便携快照：不把 journal_mode 切成 WAL（Android / 验收用）。
+    pub fn open_portable(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, false)
+    }
+
+    fn open_with(path: impl AsRef<Path>, wal: bool) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let conn = Connection::open(&path)?;
         conn.pragma_update(None, "foreign_keys", true)?;
@@ -56,7 +70,6 @@ impl Store {
         }
         let ver: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if ver == 0 {
-            // 刚创建过程中可能尚未写入；容忍并补 schema
             conn.execute_batch(include_str!("schema.sql"))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             conn.pragma_update(None, "application_id", APP_ID)?;
@@ -66,7 +79,9 @@ impl Store {
             conn.execute_batch(include_str!("schema.sql"))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
-        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        if wal {
+            let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        }
         let campaign_id: i64 = conn
             .query_row("SELECT id FROM campaigns ORDER BY id LIMIT 1", [], |r| {
                 r.get(0)
@@ -85,11 +100,11 @@ impl Store {
                 .query_row("SELECT name FROM campaigns WHERE id=?1", [self.campaign_id], |r| {
                     r.get(0)
                 })?;
-        let chunk_count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM chunks WHERE campaign_id=?1", [self.campaign_id], |r| {
-                    r.get(0)
-                })?;
+        let chunk_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE campaign_id=?1",
+            [self.campaign_id],
+            |r| r.get(0),
+        )?;
         Ok(StoreInfo {
             campaign_id: self.campaign_id,
             campaign_name: name,
@@ -99,7 +114,15 @@ impl Store {
     }
 
     pub fn close(self) -> Result<bool> {
-        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let (busy, log, checkpointed): (i64, i64, i64) = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .context("checkpoint 失败")?;
+        if busy != 0 {
+            bail!("checkpoint 未完成 busy={busy} log={log} checkpointed={checkpointed}，仍有连接占用");
+        }
         Ok(true)
     }
 
@@ -126,60 +149,94 @@ impl Store {
 
     pub fn import_paths(&mut self, paths: &[PathBuf]) -> Result<ImportReport> {
         let mut report = ImportReport::default();
-        let mut files: Vec<PathBuf> = Vec::new();
+        let mut files: Vec<(PathBuf, String)> = Vec::new();
         for p in paths {
             if p.is_dir() {
                 for e in walkdir::WalkDir::new(p).into_iter().filter_map(|e| e.ok()) {
                     if e.file_type().is_file() {
-                        files.push(e.path().to_path_buf());
+                        let abs = e.path().to_path_buf();
+                        let rel = store_rel_path(p, &abs);
+                        files.push((abs, rel));
                     }
                 }
             } else if p.is_file() {
-                files.push(p.clone());
+                let rel = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|| p.to_string_lossy().replace('\\', "/"));
+                files.push((p.clone(), rel));
             } else {
                 report.files_fail += 1;
                 report.errors.push(format!("不存在: {}", p.display()));
             }
         }
-        for f in files {
-            match self.import_one(&f) {
-                Ok(ImportOne::Skip) => report.files_skip += 1,
-                Ok(ImportOne::Done { chunks, unmatched }) => {
-                    report.files_ok += 1;
-                    report.chunks += chunks;
-                    report.unmatched_corrections += unmatched;
+        for (abs, rel) in files {
+            match classify_import(&abs) {
+                ImportClass::SilentSkip => {
+                    report.files_skip += 1;
                 }
-                Err(e) => {
-                    report.files_fail += 1;
-                    report.errors.push(format!("{}: {e}", f.display()));
+                ImportClass::Unsupported(msg) => {
+                    report.files_skip += 1;
+                    report.errors.push(format!("{}: {msg}", abs.display()));
                 }
+                ImportClass::Doc => match self.import_one(&abs, &rel) {
+                    Ok(ImportOne::Skip) => report.files_skip += 1,
+                    Ok(ImportOne::Done { chunks, unmatched }) => {
+                        report.files_ok += 1;
+                        report.chunks += chunks;
+                        report.unmatched_corrections += unmatched;
+                    }
+                    Err(e) => {
+                        report.files_fail += 1;
+                        report.errors.push(format!("{}: {e}", abs.display()));
+                    }
+                },
             }
         }
         Ok(report)
     }
 
-    fn import_one(&mut self, path: &Path) -> Result<ImportOne> {
+    fn import_one(&mut self, path: &Path, rel_path: &str) -> Result<ImportOne> {
         let bytes = fs::read(path)?;
         let file_hash = sha256_file_hex(&bytes);
-        let file_path = path.to_string_lossy().to_string();
         let file_name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| file_path.clone());
+            .unwrap_or_else(|| rel_path.to_string());
         let file_type = path
             .extension()
             .and_then(|s| s.to_str())
             .unwrap_or("txt")
             .to_ascii_lowercase();
 
-        let existing: Option<(i64, String)> = self
+        let mut existing: Option<(i64, String)> = self
             .conn
             .query_row(
                 "SELECT id, content_hash FROM source_documents WHERE campaign_id=?1 AND file_path=?2",
-                params![self.campaign_id, file_path],
+                params![self.campaign_id, rel_path],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
+
+        if existing.is_none() {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, file_path FROM source_documents WHERE campaign_id=?1 AND content_hash=?2",
+            )?;
+            let hits: Vec<(i64, String)> = stmt
+                .query_map(params![self.campaign_id, file_hash], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            if hits.len() == 1 {
+                let (id, _) = &hits[0];
+                self.conn.execute(
+                    "UPDATE source_documents SET file_path=?1, file_name=?2 WHERE id=?3",
+                    params![rel_path, file_name, id],
+                )?;
+                existing = Some((*id, file_hash.clone()));
+            }
+        }
 
         if let Some((_, h)) = &existing {
             if h == &file_hash {
@@ -198,8 +255,8 @@ impl Store {
 
         let doc_id = if let Some((id, _)) = existing {
             tx.execute(
-                "UPDATE source_documents SET content_hash=?1, file_name=?2, file_type=?3, indexed_at=?4 WHERE id=?5",
-                params![file_hash, file_name, file_type, now_rfc3339(), id],
+                "UPDATE source_documents SET content_hash=?1, file_name=?2, file_type=?3, indexed_at=?4, file_path=?5 WHERE id=?6",
+                params![file_hash, file_name, file_type, now_rfc3339(), rel_path, id],
             )?;
             id
         } else {
@@ -208,7 +265,7 @@ impl Store {
                  VALUES(?1,?2,?3,?4,?5,?6)",
                 params![
                     self.campaign_id,
-                    file_path,
+                    rel_path,
                     file_name,
                     file_type,
                     file_hash,
@@ -239,31 +296,32 @@ impl Store {
         drop(stmt);
 
         let mut used = vec![false; corrections.len()];
-        for d in drafts.iter_mut() {
-            if let Some((i, c)) = corrections.iter().enumerate().find(|(i, c)| {
-                !used[*i] && (c.stable_key == d.stable_key || c.alt_anchor.as_deref() == Some(&d.alt_anchor))
-            }) {
+        let mut draft_hit = vec![false; drafts.len()];
+        for (di, d) in drafts.iter_mut().enumerate() {
+            if let Some((i, _)) = corrections
+                .iter()
+                .enumerate()
+                .find(|(i, c)| !used[*i] && c.stable_key == d.stable_key)
+            {
+                apply_correction(d, &corrections[i]);
                 used[i] = true;
-                if let Some(t) = &c.entity_type {
-                    d.entity_type = t.clone();
-                }
-                if let Some(v) = c.visibility {
-                    d.visibility = v;
-                }
-                if let Some(aj) = &c.aliases_json {
-                    if let Ok(extra) = serde_json::from_str::<Vec<String>>(aj) {
-                        for a in extra {
-                            if !d.aliases.contains(&a) {
-                                d.aliases.push(a);
-                            }
-                        }
-                    }
-                }
+                draft_hit[di] = true;
+            }
+        }
+        for (di, d) in drafts.iter_mut().enumerate() {
+            if draft_hit[di] {
+                continue;
+            }
+            if let Some((i, _)) = corrections.iter().enumerate().find(|(i, c)| {
+                !used[*i] && c.alt_anchor.as_deref() == Some(&d.alt_anchor)
+            }) {
+                apply_correction(d, &corrections[i]);
+                used[i] = true;
+                draft_hit[di] = true;
             }
         }
         let unmatched = used.iter().filter(|u| !**u).count();
 
-        // 先 DELETE 再 INSERT，避开 UNIQUE(source_document_id, ordinal)
         tx.execute("DELETE FROM chunks WHERE source_document_id=?1", [doc_id])?;
 
         let now = now_rfc3339();
@@ -333,18 +391,25 @@ impl Store {
 
     pub fn copy_payload(&self, id: i64, template_key: &str) -> Result<String> {
         let chunk = load_chunk(&self.conn, id)?;
-        let tmpl: String = self.conn.query_row(
-            "SELECT body FROM copy_templates WHERE campaign_id=?1 AND key=?2",
-            params![self.campaign_id, template_key],
-            |r| r.get(0),
-        ).optional()?.unwrap_or_else(|| default_template(template_key).to_string());
+        let tmpl: String = self
+            .conn
+            .query_row(
+                "SELECT body FROM copy_templates WHERE campaign_id=?1 AND key=?2",
+                params![self.campaign_id, template_key],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| default_template(template_key).to_string());
         let public_body = public_body(&chunk.body, chunk.visibility);
         Ok(tmpl
             .replace("{entity_type}", &chunk.entity_type)
             .replace("{title}", &chunk.title)
             .replace("{body}", &chunk.body)
             .replace("{public_body}", &public_body)
-            .replace("{source_path}", &format!("{} · {}", chunk.file_name, chunk.parent_path)))
+            .replace(
+                "{source_path}",
+                &format!("{} · {}", chunk.file_name, chunk.parent_path),
+            ))
     }
 
     pub fn update_chunk_meta(&self, id: i64, patch: MetaPatch) -> Result<()> {
@@ -408,11 +473,29 @@ impl Store {
         )?;
         Ok(())
     }
+
+    pub fn journal_mode(&self) -> Result<String> {
+        Ok(self.conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?)
+    }
+
+    pub fn source_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_path FROM source_documents WHERE campaign_id=?1 ORDER BY file_path",
+        )?;
+        let rows = stmt.query_map([self.campaign_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
 }
 
 enum ImportOne {
     Skip,
     Done { chunks: usize, unmatched: usize },
+}
+
+enum ImportClass {
+    Doc,
+    SilentSkip,
+    Unsupported(&'static str),
 }
 
 struct CorrectionRow {
@@ -423,6 +506,48 @@ struct CorrectionRow {
     aliases_json: Option<String>,
     #[allow(dead_code)]
     tags_json: Option<String>,
+}
+
+fn classify_import(path: &Path) -> ImportClass {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "md" | "markdown" | "txt" | "html" | "htm" | "rtf" | "docx" => ImportClass::Doc,
+        "pdf" => ImportClass::Unsupported("PDF 文本层抽取未纳入本 demo"),
+        "doc" => ImportClass::Unsupported("不支持 .doc，请另存为 .docx"),
+        _ => ImportClass::SilentSkip,
+    }
+}
+
+fn store_rel_path(root: &Path, file: &Path) -> String {
+    match file.strip_prefix(root) {
+        Ok(p) => p.to_string_lossy().replace('\\', "/"),
+        Err(_) => file
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file.to_string_lossy().replace('\\', "/")),
+    }
+}
+
+fn apply_correction(d: &mut crate::types::DraftChunk, c: &CorrectionRow) {
+    if let Some(t) = &c.entity_type {
+        d.entity_type = t.clone();
+    }
+    if let Some(v) = c.visibility {
+        d.visibility = v;
+    }
+    if let Some(aj) = &c.aliases_json {
+        if let Ok(extra) = serde_json::from_str::<Vec<String>>(aj) {
+            for a in extra {
+                if !d.aliases.contains(&a) {
+                    d.aliases.push(a);
+                }
+            }
+        }
+    }
 }
 
 fn configure_new(conn: &Connection) -> Result<()> {
@@ -488,24 +613,21 @@ pub fn load_chunk(conn: &Connection, id: i64) -> Result<Chunk> {
 }
 
 pub fn public_body(body: &str, visibility: i64) -> String {
-    if visibility & (VIS_SECRET | VIS_DM_ONLY | VIS_HIDDEN) == 0 {
-        return body.to_string();
-    }
     let mut lines = Vec::new();
+    let mut stripped = false;
     for line in body.lines() {
-        let t = line.trim();
-        if t.starts_with("【秘密】")
-            || t.starts_with("【DM】")
-            || t.starts_with("【密谋】")
-            || t.contains("对玩家隐藏")
-        {
+        if is_secret_markup_line(line) {
+            stripped = true;
             continue;
         }
         lines.push(line);
     }
     let s = lines.join("\n");
-    if s.trim().is_empty() {
+    let hidden_bit = visibility & (VIS_SECRET | VIS_DM_ONLY | VIS_HIDDEN) != 0;
+    if s.trim().is_empty() && (hidden_bit || stripped) {
         "（该条目对玩家隐藏）".into()
+    } else if s.trim().is_empty() {
+        body.to_string()
     } else {
         s
     }

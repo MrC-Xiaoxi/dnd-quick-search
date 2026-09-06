@@ -22,9 +22,12 @@ pub fn char_readings(ch: char) -> Vec<String> {
     set.into_iter().collect()
 }
 
-/// 一段汉字的全部读音组合（全拼空格分词 + 首字母串）。
+/// 一段汉字的全部读音组合：空格全拼、连写全拼、首字母串。
 pub fn phrase_pinyin_variants(text: &str) -> Vec<String> {
-    let chars: Vec<char> = text.chars().filter(|c| super::normalize::is_hanzi(*c)).collect();
+    let chars: Vec<char> = text
+        .chars()
+        .filter(|c| super::normalize::is_hanzi(*c))
+        .collect();
     if chars.is_empty() {
         return Vec::new();
     }
@@ -41,10 +44,11 @@ pub fn phrase_pinyin_variants(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for combo in combos {
         out.push(combo.join(" "));
-        let initials: String = combo
-            .iter()
-            .filter_map(|s| s.chars().next())
-            .collect();
+        let compact = combo.join("");
+        if compact.chars().count() >= 3 {
+            out.push(compact);
+        }
+        let initials: String = combo.iter().filter_map(|s| s.chars().next()).collect();
         if initials.len() >= 2 {
             out.push(initials);
         }
@@ -79,19 +83,28 @@ fn cartesian(sets: &[Vec<String>], cap: usize) -> Vec<Vec<String>> {
     acc
 }
 
-/// 写入 search_text 的拼音袋：标题/别名全组合 + 正文逐字全读音。
-pub fn search_pinyin_blob(title: &str, body: &str, aliases: &[String]) -> String {
+/// 写入 search_text 的拼音袋：只展开标题和别名，不扫正文逐字读音。
+pub fn search_pinyin_blob(title: &str, aliases: &[String]) -> String {
     let mut parts = Vec::new();
     parts.extend(phrase_pinyin_variants(title));
     for a in aliases {
         parts.extend(phrase_pinyin_variants(a));
     }
-    for ch in body.chars() {
-        if super::normalize::is_hanzi(ch) {
-            for r in char_readings(ch) {
-                parts.push(r);
-            }
-        }
-    }
+    parts.sort();
+    parts.dedup();
     parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grim_has_compact_pinyin() {
+        let v = phrase_pinyin_variants("格里姆");
+        let joined = v.join("|");
+        assert!(joined.contains("gelimu") || v.iter().any(|x| x == "gelimu"), "{v:?}");
+        assert!(v.iter().any(|x| x == "glm"), "{v:?}");
+        assert!(v.iter().any(|x| x.contains(' ')), "{v:?}");
+    }
 }

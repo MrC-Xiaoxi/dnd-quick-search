@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS source_documents (
   UNIQUE(campaign_id, file_path)
 );
 
+CREATE INDEX IF NOT EXISTS idx_source_docs_hash
+  ON source_documents(campaign_id, content_hash);
+
 CREATE TABLE IF NOT EXISTS chunks (
   id                  INTEGER PRIMARY KEY,
   campaign_id         INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,

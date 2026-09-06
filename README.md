@@ -6,9 +6,10 @@
 
 ## 本版做了什么
 
-- `crates/table-canon-core`：SQLite FTS5 trigram、长口语抽词、拼音（含多音字）、别名/同义词、`chunk_corrections` 回套、先删后插避开 ordinal 撞键、`export_snapshot` 强制 `journal_mode=DELETE`、三种复制模板
+- `crates/table-canon-core`：SQLite FTS5 trigram + BM25、长口语抽词（A 层 ≥3 字）、拼音（空格全拼 / 连写 / 首字母，含多音字）、简繁静态映射、别名/同义词、`chunk_corrections` 回套、相对路径 + hash 重命名、先删后插、`export_snapshot` 强制 `journal_mode=DELETE`、`open_portable` 不切 WAL、三种复制模板
 - `apps/desktop`：Windows 置顶窗口（egui）。导入文件夹 → 粘贴玩家的话 → 检索 → 一键复制
 - 样例战役：`testdata/sample-campaign`
+- lexical 门禁：`testdata/eval.jsonl`（≥30 条，Recall@10）
 
 明确未做（方案里标 M2/M3 或本 demo 砍掉的）：语义 embedding、全局热键、PDF 文本层、文件夹监视、Tauri。
 
@@ -33,6 +34,8 @@ cargo run -p table-canon-desktop --release
 2. **导入文件夹** → 选 `testdata/sample-campaign`
 3. 搜索框粘贴：`我们之前在那个独眼酒保的店里拿到了货`
 4. 点 **复制公开**（密谋段应被剥掉）
+
+也可用 `gelimu`、`老格`、`斷桅酒館` 验证拼音、2 字别名和简繁。
 
 ## 库文件
 

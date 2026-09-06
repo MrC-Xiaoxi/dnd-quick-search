@@ -1,12 +1,17 @@
-use crate::normalize::{alt_anchor, hanzi_count, normalize, sha1_body_hex, stable_key};
+use crate::normalize::{
+    alt_anchor, first_n_chars, hanzi_count, normalize, sha1_body_hex, stable_key,
+    stable_key_with_ordinal,
+};
 use crate::pinyin_idx::search_pinyin_blob;
 use crate::types::{Block, DraftChunk, VIS_DM_ONLY, VIS_PUBLIC, VIS_SECRET};
 use anyhow::{Context, Result};
 use encoding_rs::{Encoding, GB18030, UTF_8};
 use regex::Regex;
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::sync::OnceLock;
 
 pub fn read_text_file(path: &Path) -> Result<String> {
     let bytes = fs::read(path)?;
@@ -35,32 +40,112 @@ pub fn parse_file(path: &Path) -> Result<Vec<Block>> {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "md" | "markdown" | "txt" | "html" | "htm" | "rtf" => {
+        "md" | "markdown" => {
             let text = read_text_file(path)?;
-            if ext == "html" || ext == "htm" {
-                Ok(blocks_from_plain(&strip_html(&text)))
-            } else if ext == "md" || ext == "markdown" {
-                Ok(blocks_from_markdown(&text))
-            } else {
-                Ok(blocks_from_plain(&text))
-            }
+            Ok(blocks_from_markdown(&text))
         }
-        "docx" => parse_docx(path),
-        "pdf" => anyhow::bail!("PDF 文本层抽取未纳入本 demo（见方案：扫描件/缺 CMap 不进 M1 闭环）"),
-        "doc" => anyhow::bail!("不支持 .doc，请另存为 .docx"),
-        _ => {
+        "html" | "htm" => {
+            let text = read_text_file(path)?;
+            Ok(blocks_from_html(&text))
+        }
+        "txt" | "rtf" => {
             let text = read_text_file(path)?;
             Ok(blocks_from_plain(&text))
         }
+        "docx" => parse_docx(path),
+        "pdf" => anyhow::bail!("PDF 文本层抽取未纳入本 demo"),
+        "doc" => anyhow::bail!("不支持 .doc，请另存为 .docx"),
+        _ => anyhow::bail!("不支持的文件类型: {ext}"),
     }
 }
 
+fn html_heading_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?is)<h([1-4])[^>]*>(.*?)</h[1-4]>").expect("html heading re"))
+}
+
+fn strip_tag_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<[^>]+>")
+            .expect("strip tag re")
+    })
+}
+
+fn para_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?s)<w:p[ >](.*?)</w:p>").expect("docx p re"))
+}
+
+fn wt_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?s)<w:t[^>]*>(.*?)</w:t>").expect("docx t re"))
+}
+
+fn style_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"w:val="(Heading[1-4]|heading[1-4])""#).expect("docx style re")
+    })
+}
+
+fn alias_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?:又名|别名|亦称)[:：]\s*([^\n]+)").expect("alias re"))
+}
+
+fn title_paren_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(.+?)[（(]([^）)]+)[）)]").expect("title paren re"))
+}
+
 fn strip_html(s: &str) -> String {
-    let re = Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<[^>]+>").unwrap();
-    re.replace_all(s, " ").to_string()
+    strip_tag_re().replace_all(s, " ").to_string()
+}
+
+fn blocks_from_html(html: &str) -> Vec<Block> {
+    let marked = html_heading_re().replace_all(html, |caps: &regex::Captures| {
+        let level: usize = caps[1].parse().unwrap_or(1);
+        let inner = strip_html(&caps[2]);
+        format!("\n{} {}\n", "#".repeat(level.clamp(1, 4)), inner.trim())
+    });
+    blocks_from_markdown(&strip_html(&marked))
+}
+
+fn atx_heading(t: &str) -> Option<(u8, String)> {
+    if !t.starts_with('#') {
+        return None;
+    }
+    let mut level = 0u8;
+    let mut rest = t;
+    while let Some(stripped) = rest.strip_prefix('#') {
+        level += 1;
+        rest = stripped;
+        if level >= 4 {
+            break;
+        }
+    }
+    if !(rest.starts_with(' ') || rest.starts_with('\t')) {
+        return None;
+    }
+    let title = rest.trim().trim_end_matches('#').trim();
+    Some((
+        level.max(1),
+        if title.is_empty() {
+            "未命名".into()
+        } else {
+            title.to_string()
+        },
+    ))
+}
+
+fn is_setext_underline(t: &str, ch: char) -> bool {
+    let t = t.trim();
+    t.len() >= 3 && t.chars().all(|c| c == ch)
 }
 
 fn blocks_from_markdown(text: &str) -> Vec<Block> {
+    let lines: Vec<&str> = text.lines().collect();
     let mut blocks = Vec::new();
     let mut cur_level: u8 = 1;
     let mut cur_title = "文档".to_string();
@@ -68,9 +153,6 @@ fn blocks_from_markdown(text: &str) -> Vec<Block> {
     let flush = |blocks: &mut Vec<Block>, title: &str, level: u8, buf: &mut String| {
         let body = buf.trim().to_string();
         buf.clear();
-        if body.is_empty() && title == "文档" {
-            return;
-        }
         if body.is_empty() {
             return;
         }
@@ -80,34 +162,45 @@ fn blocks_from_markdown(text: &str) -> Vec<Block> {
             text: body,
         });
     };
-    for line in text.lines() {
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
         let t = line.trim_end();
-        if let Some(rest) = t.strip_prefix('#') {
-            let mut level = 1u8;
-            let mut r = rest;
-            while let Some(x) = r.strip_prefix('#') {
-                level += 1;
-                r = x;
-                if level >= 4 {
-                    break;
+        if let Some((level, title)) = atx_heading(t) {
+            flush(&mut blocks, &cur_title, cur_level, &mut buf);
+            cur_level = level;
+            cur_title = title;
+            i += 1;
+            continue;
+        }
+        if i + 1 < lines.len() {
+            let next = lines[i + 1].trim();
+            let heading = t.trim();
+            if !heading.is_empty() && heading.chars().count() <= 80 {
+                if is_setext_underline(next, '=') {
+                    flush(&mut blocks, &cur_title, cur_level, &mut buf);
+                    cur_level = 1;
+                    cur_title = heading.to_string();
+                    i += 2;
+                    continue;
                 }
-            }
-            if r.starts_with(' ') || r.starts_with('\t') || level >= 1 {
-                flush(&mut blocks, &cur_title, cur_level, &mut buf);
-                cur_level = level.min(4);
-                cur_title = r.trim().trim_start_matches('#').trim().to_string();
-                if cur_title.is_empty() {
-                    cur_title = "未命名".into();
+                if is_setext_underline(next, '-') {
+                    flush(&mut blocks, &cur_title, cur_level, &mut buf);
+                    cur_level = 2;
+                    cur_title = heading.to_string();
+                    i += 2;
+                    continue;
                 }
-                continue;
             }
         }
-        if t == "---" || t == "***" {
+        if t == "***" || t == "---" || t == "___" {
             flush(&mut blocks, &cur_title, cur_level, &mut buf);
+            i += 1;
             continue;
         }
         buf.push_str(line);
         buf.push('\n');
+        i += 1;
     }
     flush(&mut blocks, &cur_title, cur_level, &mut buf);
     if blocks.is_empty() {
@@ -118,10 +211,7 @@ fn blocks_from_markdown(text: &str) -> Vec<Block> {
 }
 
 fn blocks_from_plain(text: &str) -> Vec<Block> {
-    let paras: Vec<&str> = text
-        .split(|c| c == '\n')
-        .map(str::trim_end)
-        .collect();
+    let paras: Vec<&str> = text.split('\n').map(str::trim_end).collect();
     let mut chunks = Vec::new();
     let mut buf = String::new();
     for p in paras {
@@ -152,7 +242,7 @@ fn blocks_from_plain(text: &str) -> Vec<Block> {
         .filter(|c| !c.trim().is_empty())
         .enumerate()
         .map(|(i, text)| {
-            let title = crate::normalize::first_n_chars(&normalize(&text), 40);
+            let title = first_n_chars(&normalize(&text), 40);
             Block {
                 heading_level: 1,
                 title: if title.is_empty() {
@@ -215,20 +305,17 @@ fn parse_docx(path: &Path) -> Result<Vec<Block>> {
     xml_file.read_to_string(&mut xml)?;
     drop(xml_file);
     let mut blocks = Vec::new();
-    let para_re = Regex::new(r"(?s)<w:p[ >](.*?)</w:p>").unwrap();
-    let t_re = Regex::new(r"(?s)<w:t[^>]*>(.*?)</w:t>").unwrap();
-    let style_re = Regex::new(r#"w:val="(Heading[1-4]|heading[1-4])""#).unwrap();
     let mut cur_title = "文档".to_string();
     let mut cur_level: u8 = 1;
     let mut buf = String::new();
-    for cap in para_re.captures_iter(&xml) {
+    for cap in para_re().captures_iter(&xml) {
         let p = &cap[1];
         let mut text = String::new();
-        for t in t_re.captures_iter(p) {
+        for t in wt_re().captures_iter(p) {
             text.push_str(&decode_xml_entities(&t[1]));
         }
         text = text.trim().to_string();
-        if let Some(st) = style_re.captures(p) {
+        if let Some(st) = style_re().captures(p) {
             if !buf.trim().is_empty() {
                 blocks.push(Block {
                     heading_level: cur_level,
@@ -281,7 +368,7 @@ fn decode_xml_entities(s: &str) -> String {
 }
 
 pub fn guess_entity_type(title: &str, body: &str) -> String {
-    let h = format!("{title}\n{}", crate::normalize::first_n_chars(body, 80));
+    let h = format!("{title}\n{}", first_n_chars(body, 80));
     let keys = [
         ("npc", &["NPC", "人物", "角色"][..]),
         ("location", &["地点", "城镇", "酒馆", "港口", "城市", "村庄"]),
@@ -300,9 +387,8 @@ pub fn guess_entity_type(title: &str, body: &str) -> String {
 
 pub fn extract_aliases(title: &str, body: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let re = Regex::new(r"(?:又名|别名|亦称)[:：]\s*([^\n]+)").unwrap();
     let blob = format!("{title}\n{body}");
-    for cap in re.captures_iter(&blob) {
+    for cap in alias_re().captures_iter(&blob) {
         for part in cap[1].split(|c| "、,/，;；".contains(c)) {
             let t = part.trim();
             if !t.is_empty() {
@@ -310,8 +396,7 @@ pub fn extract_aliases(title: &str, body: &str) -> Vec<String> {
             }
         }
     }
-    let paren = Regex::new(r"(.+?)[（(]([^）)]+)[）)]").unwrap();
-    if let Some(c) = paren.captures(title) {
+    if let Some(c) = title_paren_re().captures(title) {
         let inner = c[2].trim();
         if !inner.is_empty() && inner.chars().count() <= 20 {
             out.push(inner.to_string());
@@ -337,9 +422,18 @@ pub fn guess_visibility(body: &str) -> i64 {
     v
 }
 
+pub fn is_secret_markup_line(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("【秘密】")
+        || t.starts_with("【DM】")
+        || t.starts_with("【密谋】")
+        || t.contains("对玩家隐藏")
+}
+
 pub fn blocks_to_drafts(blocks: &[Block], file_stem: &str) -> Vec<DraftChunk> {
     let mut path_stack: Vec<(u8, String)> = vec![(0, file_stem.to_string())];
     let mut drafts = Vec::new();
+    let mut used_keys = HashSet::new();
     for (i, b) in blocks.iter().enumerate() {
         while path_stack
             .last()
@@ -356,14 +450,19 @@ pub fn blocks_to_drafts(blocks: &[Block], file_stem: &str) -> Vec<DraftChunk> {
             .collect::<Vec<_>>()
             .join(" / ");
         let title = if b.title.trim().is_empty() {
-            crate::normalize::first_n_chars(&normalize(&b.text), 40)
+            first_n_chars(&normalize(&b.text), 40)
         } else {
             b.title.clone()
         };
         let ordinal = i as i64;
         let aliases = extract_aliases(&title, &b.text);
+        let mut key = stable_key(&parent_path, &title);
+        if !used_keys.insert(key.clone()) {
+            key = stable_key_with_ordinal(&parent_path, &title, ordinal);
+            used_keys.insert(key.clone());
+        }
         drafts.push(DraftChunk {
-            stable_key: stable_key(&parent_path, &title, ordinal),
+            stable_key: key,
             alt_anchor: alt_anchor(&parent_path, &b.text),
             ordinal,
             entity_type: guess_entity_type(&title, &b.text),
@@ -389,9 +488,46 @@ pub fn build_search_text(
         body.to_string(),
         aliases.join("\n"),
         extra_synonyms.join("\n"),
-        search_pinyin_blob(title, body, aliases),
+        search_pinyin_blob(title, aliases),
         normalize(body),
     ];
     parts.retain(|s| !s.trim().is_empty());
     parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atx_requires_space() {
+        let blocks = blocks_from_markdown("#not-heading\n\n# Real Title\n\nbody");
+        assert!(
+            blocks.iter().any(|b| b.title == "Real Title"),
+            "{:?}",
+            blocks.iter().map(|b| &b.title).collect::<Vec<_>>()
+        );
+        assert!(
+            !blocks.iter().any(|b| b.title == "not-heading"),
+            "{:?}",
+            blocks.iter().map(|b| &b.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn html_headings() {
+        let blocks = blocks_from_html("<h2>断桅酒馆</h2><p>地点。一楼卖劣酒。</p>");
+        assert!(
+            blocks.iter().any(|b| b.title.contains("断桅酒馆")),
+            "{:?}",
+            blocks.iter().map(|b| &b.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn gb18030_roundtrip() {
+        let (bytes, _, _) = encoding_rs::GB18030.encode("独眼酒保");
+        let s = decode_bytes(&bytes).unwrap();
+        assert!(s.contains("独眼酒保"), "{s}");
+    }
 }
