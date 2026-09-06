@@ -1,4 +1,5 @@
 use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, RichText, ViewportBuilder};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use table_canon_core::{Hit, MetaPatch, SearchResult, Store, StoreInfo, VIS_PUBLIC, VIS_SECRET};
@@ -39,6 +40,7 @@ struct App {
     pending: Option<Pending>,
     focus_search: bool,
     search_focused: bool,
+    expanded: HashSet<i64>,
 }
 
 impl App {
@@ -59,6 +61,7 @@ impl App {
             pending: None,
             focus_search: true,
             search_focused: false,
+            expanded: HashSet::new(),
         };
         if let Some(p) = load_last_store_path() {
             match Store::open(&p) {
@@ -116,6 +119,7 @@ impl App {
                     .join(" / ");
                 self.status = format!("{} ms · 抽词 {} · 命中 {}", r.latency_ms, terms, r.hits.len());
                 self.selected = r.hits.first().map(|h| h.chunk.id);
+                self.expanded.clear();
                 self.last = Some(r);
             }
             Err(e) => self.status = format!("检索失败: {e}"),
@@ -429,7 +433,17 @@ impl eframe::App for App {
                         if !h.chunk.aliases.is_empty() {
                             ui.label(format!("别名：{}", h.chunk.aliases.join(" / ")));
                         }
-                        ui.label(RichText::new(&h.chunk.body).size(16.0));
+                        let q = self.query.trim();
+                        let expanded = self.expanded.contains(&h.chunk.id);
+                        let (preview, clipped) = snippet_around(&h.chunk.body, q, 280);
+                        if expanded || !clipped {
+                            ui.label(RichText::new(&h.chunk.body).size(16.0));
+                        } else {
+                            ui.label(RichText::new(&preview).size(16.0));
+                            if ui.small_button("展开全文").clicked() {
+                                self.expanded.insert(h.chunk.id);
+                            }
+                        }
                         ui.label(
                             RichText::new(format!("{} · {}", h.chunk.file_name, h.chunk.parent_path))
                                 .small()
@@ -464,6 +478,33 @@ impl eframe::App for App {
             });
         });
     }
+}
+
+fn snippet_around(body: &str, query: &str, max_chars: usize) -> (String, bool) {
+    let chars: Vec<char> = body.chars().collect();
+    if chars.len() <= max_chars {
+        return (body.to_string(), false);
+    }
+    let q = query.trim();
+    let idx = if q.is_empty() {
+        None
+    } else {
+        body.find(q)
+    };
+    let start_char = if let Some(byte_idx) = idx {
+        body[..byte_idx].chars().count().saturating_sub(80)
+    } else {
+        0
+    };
+    let end_char = (start_char + max_chars).min(chars.len());
+    let mut s: String = chars[start_char..end_char].iter().collect();
+    if start_char > 0 {
+        s = format!("…{s}");
+    }
+    if end_char < chars.len() {
+        s.push('…');
+    }
+    (s, true)
 }
 
 fn appdata_dir() -> PathBuf {

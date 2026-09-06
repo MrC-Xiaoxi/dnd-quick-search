@@ -301,15 +301,16 @@ fn blocks_from_plain(text: &str) -> Vec<Block> {
 }
 
 fn split_long_blocks(blocks: Vec<Block>) -> Vec<Block> {
+    const MAX: usize = 900;
     let mut out = Vec::new();
     for b in blocks {
-        if b.text.chars().count() <= 2000 {
+        if b.text.chars().count() <= MAX {
             out.push(b);
             continue;
         }
         let mut acc = String::new();
         for para in b.text.split('\n') {
-            if acc.chars().count() + para.chars().count() > 2000 && !acc.is_empty() {
+            if acc.chars().count() + para.chars().count() > MAX && !acc.is_empty() {
                 out.push(Block {
                     heading_level: b.heading_level,
                     title: b.title.clone(),
@@ -318,7 +319,7 @@ fn split_long_blocks(blocks: Vec<Block>) -> Vec<Block> {
                 let overlap: String = acc
                     .chars()
                     .rev()
-                    .take(80)
+                    .take(40)
                     .collect::<String>()
                     .chars()
                     .rev()
@@ -411,6 +412,24 @@ fn looks_like_heading_text(text: &str) -> Option<u8> {
     }
     if t.starts_with('第') && (t.contains('章') || t.contains('节') || t.contains('回')) {
         return Some(1);
+    }
+    if n > 12 {
+        return None;
+    }
+    if let Some((k, v)) = t.split_once('：').or_else(|| t.split_once(':')) {
+        if !k.is_empty() && v.chars().count() >= 2 {
+            return None;
+        }
+    }
+    let last = t.chars().last()?;
+    if "。！？；;".contains(last) {
+        return None;
+    }
+    if t.contains('。') || t.contains('！') || t.contains('？') {
+        return None;
+    }
+    if n >= 2 {
+        return Some(2);
     }
     None
 }
@@ -841,6 +860,13 @@ mod tests {
     #[test]
     fn chapter_line_is_heading() {
         assert_eq!(looks_like_heading_text("第1章 接受任务"), Some(1));
+        assert_eq!(looks_like_heading_text("第0章 故事和背景介绍"), Some(1));
+        assert_eq!(looks_like_heading_text("游玩提示"), Some(2));
+        assert_eq!(looks_like_heading_text("适合玩家和难度"), Some(2));
         assert_eq!(looks_like_heading_text("猎人工会的登记员在统计伤亡"), None);
+        assert_eq!(
+            looks_like_heading_text("本模组适合4至6名玩家进行游玩，适合那些喜爱黑暗奇幻的玩家。"),
+            None
+        );
     }
 }

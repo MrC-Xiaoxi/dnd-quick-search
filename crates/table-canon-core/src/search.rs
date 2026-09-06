@@ -135,6 +135,7 @@ fn contains_boost(chunk: &Chunk, q: &str) -> f64 {
         return 0.0;
     }
     let title = crate::normalize::normalize(&chunk.title);
+    let body = crate::normalize::normalize(&chunk.body);
     if title == *q {
         return 12.0;
     }
@@ -148,10 +149,13 @@ fn contains_boost(chunk: &Chunk, q: &str) -> f64 {
     {
         return 6.0;
     }
-    if crate::normalize::normalize(&chunk.body).contains(q) {
-        return 3.0;
+    let hits = body.matches(q).count() as f64;
+    if hits <= 0.0 {
+        return 0.0;
     }
-    0.0
+    // 短条目里点名，压过整章背景里顺带提到一次
+    let len = body.chars().count().max(1) as f64;
+    4.0 * hits / (1.0 + len / 160.0)
 }
 
 fn like_scan(
