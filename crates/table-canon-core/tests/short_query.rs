@@ -37,3 +37,22 @@ fn two_char_query_hits_body_not_only_title() {
         "结果不应含 Word XML"
     );
 }
+
+#[test]
+fn titled_entry_outranks_body_mention() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("lore.md");
+    fs::write(
+        &src,
+        "# 猎人工会\n\n登记处设在熔炉区。\n\n# 终燃城背景\n\n故事中角色可能是猎人工会的注册猎人，也可能是照光骑士。背景很长很长很长很长很长很长很长很长很长很长。\n",
+    )
+    .unwrap();
+    let mut store = Store::create(dir.path().join("t.tcs"), "t").unwrap();
+    store.import_paths(&[src]).unwrap();
+    let r = store.search("工会").unwrap();
+    assert!(
+        r.hits[0].chunk.title.contains("猎人工会"),
+        "标题命中应排在正文提及之前，got {:?}",
+        r.hits.iter().map(|h| &h.chunk.title).collect::<Vec<_>>()
+    );
+}

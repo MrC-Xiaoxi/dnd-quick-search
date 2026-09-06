@@ -434,44 +434,63 @@ impl eframe::App for App {
                             ui.label(format!("别名：{}", h.chunk.aliases.join(" / ")));
                         }
                         let q = self.query.trim();
+                        let is_entry = h.via.iter().any(|v| v == "index")
+                            || (!q.is_empty() && h.chunk.title.contains(q));
+                        let badge = if is_entry { "条目" } else { "正文" };
+                        ui.label(
+                            RichText::new(badge).color(if is_entry {
+                                Color32::from_rgb(232, 196, 104)
+                            } else {
+                                Color32::from_rgb(140, 140, 140)
+                            }),
+                        );
                         let expanded = self.expanded.contains(&h.chunk.id);
-                        let (preview, clipped) = snippet_around(&h.chunk.body, q, 280);
-                        if expanded || !clipped {
-                            ui.label(RichText::new(&h.chunk.body).size(16.0));
-                        } else {
-                            ui.label(RichText::new(&preview).size(16.0));
-                            if ui.small_button("展开全文").clicked() {
-                                self.expanded.insert(h.chunk.id);
+                        if on {
+                            let (preview, clipped) = snippet_around(&h.chunk.body, q, 280);
+                            if expanded || !clipped {
+                                ui.label(RichText::new(&h.chunk.body).size(16.0));
+                            } else {
+                                ui.label(RichText::new(&preview).size(16.0));
+                                if ui.small_button("展开全文").clicked() {
+                                    self.expanded.insert(h.chunk.id);
+                                }
                             }
+                        } else {
+                            let (preview, _) = snippet_around(&h.chunk.body, q, 72);
+                            ui.label(RichText::new(preview).weak().size(14.0));
                         }
                         ui.label(
                             RichText::new(format!("{} · {}", h.chunk.file_name, h.chunk.parent_path))
                                 .small()
                                 .weak(),
                         );
-                        ui.horizontal(|ui| {
-                            if ui.button("复制公开").clicked() {
-                                self.copy(h.chunk.id, "player");
-                            }
-                            if ui.button("复制全文").clicked() {
-                                self.copy(h.chunk.id, "full");
-                            }
-                            if ui.button("复制来源").clicked() {
-                                self.copy(h.chunk.id, "source");
-                            }
-                            if ui.button("标为秘密").clicked() {
-                                if let Some(s) = &self.store {
-                                    let _ = s.update_chunk_meta(
-                                        h.chunk.id,
-                                        MetaPatch {
-                                            visibility: Some(h.chunk.visibility | VIS_SECRET | VIS_PUBLIC),
-                                            ..Default::default()
-                                        },
-                                    );
+                        if on {
+                            ui.horizontal(|ui| {
+                                if ui.button("复制公开").clicked() {
+                                    self.copy(h.chunk.id, "player");
                                 }
-                                self.do_search();
-                            }
-                        });
+                                if ui.button("复制全文").clicked() {
+                                    self.copy(h.chunk.id, "full");
+                                }
+                                if ui.button("复制来源").clicked() {
+                                    self.copy(h.chunk.id, "source");
+                                }
+                                if ui.button("标为秘密").clicked() {
+                                    if let Some(s) = &self.store {
+                                        let _ = s.update_chunk_meta(
+                                            h.chunk.id,
+                                            MetaPatch {
+                                                visibility: Some(
+                                                    h.chunk.visibility | VIS_SECRET | VIS_PUBLIC,
+                                                ),
+                                                ..Default::default()
+                                            },
+                                        );
+                                    }
+                                    self.do_search();
+                                }
+                            });
+                        }
                     });
                     ui.add_space(8.0);
                 }

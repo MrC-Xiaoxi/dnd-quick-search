@@ -586,9 +586,40 @@ pub fn extract_aliases(title: &str, body: &str) -> Vec<String> {
             out.push(inner.to_string());
         }
     }
+    if let Some(en) = latin_tail_alias(title) {
+        out.push(en);
+    }
     out.sort();
     out.dedup();
     out
+}
+
+fn latin_tail_alias(title: &str) -> Option<String> {
+    let chars: Vec<char> = title.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    let mut i = chars.len();
+    while i > 0 {
+        let c = chars[i - 1];
+        if c.is_ascii_alphabetic() || c.is_ascii_whitespace() || c == '-' || c == '\'' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    if i == 0 || i == chars.len() {
+        return None;
+    }
+    if !chars[..i].iter().any(|c| crate::normalize::is_hanzi(*c)) {
+        return None;
+    }
+    let tail: String = chars[i..].iter().collect::<String>().trim().to_string();
+    if tail.chars().count() >= 2 {
+        Some(tail)
+    } else {
+        None
+    }
 }
 
 pub fn guess_visibility(body: &str) -> i64 {

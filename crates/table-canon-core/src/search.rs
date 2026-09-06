@@ -62,8 +62,30 @@ pub fn search(conn: &Connection, campaign_id: i64, q: SearchQuery<'_>) -> Result
     }
 
     let qn = crate::normalize::normalize(&q0);
-    if hanzi_count(&qn) >= 1 && hanzi_count(&qn) <= 4 && !timed_out(started) {
-        like_scan(conn, campaign_id, &qn, &mut ranks);
+    let n_hanzi = hanzi_count(&qn);
+    // 不全书 HHK：先扫标题/别名/路径（条目索引）
+    if n_hanzi >= 1 && n_hanzi <= 12 && !timed_out(started) {
+        like_scan(
+            conn,
+            campaign_id,
+            &qn,
+            "title LIKE ?2 ESCAPE '\\' OR aliases_json LIKE ?2 ESCAPE '\\' OR parent_path LIKE ?2 ESCAPE '\\'",
+            2.4,
+            "index",
+            &mut ranks,
+        );
+    }
+    // 不全书 Search 页：正文只作补召回，权重低
+    if n_hanzi >= 1 && n_hanzi <= 4 && !timed_out(started) {
+        like_scan(
+            conn,
+            campaign_id,
+            &qn,
+            "body LIKE ?2 ESCAPE '\\'",
+            0.35,
+            "body",
+            &mut ranks,
+        );
     }
 
     if ranks.len() < 3 && !pinyin_terms.is_empty() && !timed_out(started) {
@@ -94,9 +116,13 @@ pub fn search(conn: &Connection, campaign_id: i64, q: SearchQuery<'_>) -> Result
         }
     }
     hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        indexish(b, &qn)
+            .cmp(&indexish(a, &qn))
+            .then(
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
             .then(a.chunk.source_rank.cmp(&b.chunk.source_rank))
             .then(a.chunk.title.cmp(&b.chunk.title))
     });
@@ -158,21 +184,36 @@ fn contains_boost(chunk: &Chunk, q: &str) -> f64 {
     4.0 * hits / (1.0 + len / 160.0)
 }
 
+fn indexish(hit: &Hit, q: &str) -> bool {
+    if q.is_empty() {
+        return false;
+    }
+    if hit.via.iter().any(|v| v == "index") {
+        return true;
+    }
+    let title = crate::normalize::normalize(&hit.chunk.title);
+    title.contains(q)
+        || hit
+            .chunk
+            .aliases
+            .iter()
+            .any(|a| crate::normalize::normalize(a).contains(q))
+}
+
 fn like_scan(
     conn: &Connection,
     campaign_id: i64,
     needle: &str,
+    where_sql: &str,
+    weight: f64,
+    via: &str,
     ranks: &mut HashMap<i64, (f64, Vec<String>)>,
 ) {
     let like = format!("%{}%", escape_like(needle));
-    let sql = "SELECT id FROM chunks
-         WHERE campaign_id=?1 AND (
-            title LIKE ?2 ESCAPE '\\'
-            OR aliases_json LIKE ?2 ESCAPE '\\'
-            OR body LIKE ?2 ESCAPE '\\'
-         )
-         LIMIT 50";
-    let Ok(mut stmt) = conn.prepare(sql) else {
+    let sql = format!(
+        "SELECT id FROM chunks WHERE campaign_id=?1 AND ({where_sql}) LIMIT 40"
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
         return;
     };
     let Ok(ids) = stmt
@@ -182,7 +223,7 @@ fn like_scan(
         return;
     };
     for (i, id) in ids.into_iter().enumerate() {
-        add_rank(ranks, id, i, 1.2, "like");
+        add_rank(ranks, id, i, weight, via);
     }
 }
 
