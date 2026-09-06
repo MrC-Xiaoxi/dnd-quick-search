@@ -42,6 +42,13 @@ fn import_search_copy_reimport_snapshot() {
         "paths should be relative, got {paths:?}"
     );
 
+    let mara = store.search("玛拉").unwrap();
+    assert!(
+        mara.hits.iter().any(|h| h.chunk.title.contains("玛拉")),
+        "sample docx should index 玛拉, titles={:?}",
+        mara.hits.iter().map(|h| &h.chunk.title).collect::<Vec<_>>()
+    );
+
     let r0 = store
         .search("我们之前在那个独眼酒保的店里拿到了货")
         .unwrap();

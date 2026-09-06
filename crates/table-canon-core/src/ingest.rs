@@ -4,7 +4,7 @@ use crate::normalize::{
 };
 use crate::pinyin_idx::search_pinyin_blob;
 use crate::types::{Block, DraftChunk, VIS_DM_ONLY, VIS_PUBLIC, VIS_SECRET};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use encoding_rs::{Encoding, GB18030, UTF_8};
 use regex::Regex;
 use std::collections::HashSet;
@@ -82,10 +82,54 @@ fn wt_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?s)<w:t[^>]*>(.*?)</w:t>").expect("docx t re"))
 }
 
-fn style_re() -> &'static Regex {
+fn tbl_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?s)<w:tbl[\s>].*?</w:tbl>").expect("docx tbl re"))
+}
+
+fn tr_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?s)<w:tr[\s>].*?</w:tr>").expect("docx tr re"))
+}
+
+fn tc_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?s)<w:tc[\s>].*?</w:tc>").expect("docx tc re"))
+}
+
+fn del_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?s)<w:del\b[^>]*>.*?</w:del>").expect("docx del re"))
+}
+
+fn instr_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"w:val="(Heading[1-4]|heading[1-4])""#).expect("docx style re")
+        Regex::new(r"(?s)<w:instrText\b[^>]*>.*?</w:instrText>").expect("docx instr re")
+    })
+}
+
+fn br_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"<w:br\b[^>]*/?>").expect("docx br re"))
+}
+
+fn tab_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"<w:tab\b[^>]*/?>").expect("docx tab re"))
+}
+
+fn pstyle_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"<w:pStyle\b[^>]*\bw:val="([^"]+)""#).expect("docx pstyle re")
+    })
+}
+
+fn outline_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"<w:outlineLvl\b[^>]*\bw:val="(\d+)""#).expect("docx outline re")
     })
 }
 
@@ -295,64 +339,158 @@ fn split_long_blocks(blocks: Vec<Block>) -> Vec<Block> {
     out
 }
 
-fn parse_docx(path: &Path) -> Result<Vec<Block>> {
-    let file = fs::File::open(path)?;
-    let mut zip = zip::ZipArchive::new(file).context("打开 docx")?;
-    let mut xml_file = zip
-        .by_name("word/document.xml")
-        .context("docx 缺少 word/document.xml")?;
-    let mut xml = String::new();
-    xml_file.read_to_string(&mut xml)?;
-    drop(xml_file);
+fn heading_n(s: &str) -> Option<u8> {
+    let n: u8 = s.trim().parse().ok()?;
+    (1..=4).contains(&n).then_some(n)
+}
+
+fn heading_level_from_style(val: &str) -> Option<u8> {
+    let v = val.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let lower = v.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("heading") {
+        return heading_n(rest);
+    }
+    for prefix in ["标题", "標題"] {
+        if let Some(rest) = v.strip_prefix(prefix) {
+            return heading_n(rest);
+        }
+    }
+    if v.chars().all(|c| c.is_ascii_digit()) {
+        return heading_n(v);
+    }
+    None
+}
+
+fn heading_level_from_p(p: &str) -> Option<u8> {
+    if let Some(c) = pstyle_re().captures(p) {
+        if let Some(lv) = heading_level_from_style(&c[1]) {
+            return Some(lv);
+        }
+    }
+    if let Some(c) = outline_re().captures(p) {
+        let n: u8 = c[1].parse().ok()?;
+        if n <= 3 {
+            return Some(n + 1);
+        }
+    }
+    None
+}
+
+fn paragraph_text(p: &str) -> String {
+    let with_br = br_re().replace_all(p, "\n");
+    let with_tab = tab_re().replace_all(&with_br, " ");
+    let mut text = String::new();
+    for t in wt_re().captures_iter(&with_tab) {
+        text.push_str(&decode_xml_entities(&t[1]));
+    }
+    text
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn cell_text(tc: &str) -> String {
+    let mut parts = Vec::new();
+    for cap in para_re().captures_iter(tc) {
+        let t = paragraph_text(&cap[1]);
+        let t = t.trim();
+        if !t.is_empty() {
+            parts.push(t.to_string());
+        }
+    }
+    parts.join(" ")
+}
+
+fn flatten_table(tbl: &str) -> String {
+    let mut out = String::new();
+    for row in tr_re().captures_iter(tbl) {
+        let mut cells: Vec<String> = tc_re()
+            .captures_iter(&row[0])
+            .map(|c| cell_text(&c[0]))
+            .collect();
+        while cells.last().is_some_and(|s| s.is_empty()) {
+            cells.pop();
+        }
+        if cells.is_empty() || cells.iter().all(|s| s.is_empty()) {
+            continue;
+        }
+        let line = if cells.len() == 2 {
+            format!("{}：{}", cells[0], cells[1])
+        } else {
+            cells.join(" / ")
+        };
+        out.push_str("<w:p><w:r><w:t>");
+        out.push_str(&xml_escape(&line));
+        out.push_str("</w:t></w:r></w:p>");
+    }
+    out
+}
+
+fn blocks_from_docx_xml(xml: &str) -> Vec<Block> {
+    let xml = del_re().replace_all(xml, "");
+    let xml = instr_re().replace_all(&xml, "");
+    let xml = tbl_re().replace_all(&xml, |caps: &regex::Captures| flatten_table(&caps[0]));
     let mut blocks = Vec::new();
     let mut cur_title = "文档".to_string();
     let mut cur_level: u8 = 1;
     let mut buf = String::new();
+    let flush = |blocks: &mut Vec<Block>, title: &str, level: u8, buf: &mut String| {
+        let body = buf.trim().to_string();
+        buf.clear();
+        if body.is_empty() {
+            return;
+        }
+        blocks.push(Block {
+            heading_level: level,
+            title: title.to_string(),
+            text: body,
+        });
+    };
     for cap in para_re().captures_iter(&xml) {
         let p = &cap[1];
-        let mut text = String::new();
-        for t in wt_re().captures_iter(p) {
-            text.push_str(&decode_xml_entities(&t[1]));
-        }
-        text = text.trim().to_string();
-        if let Some(st) = style_re().captures(p) {
-            if !buf.trim().is_empty() {
-                blocks.push(Block {
-                    heading_level: cur_level,
-                    title: cur_title.clone(),
-                    text: buf.trim().to_string(),
-                });
-                buf.clear();
-            }
-            cur_title = if text.is_empty() {
+        let trimmed = paragraph_text(p).trim().to_string();
+        if let Some(level) = heading_level_from_p(p) {
+            flush(&mut blocks, &cur_title, cur_level, &mut buf);
+            cur_title = if trimmed.is_empty() {
                 "未命名".into()
             } else {
-                text.clone()
+                trimmed
             };
-            let n = st[1]
-                .chars()
-                .last()
-                .and_then(|c| c.to_digit(10))
-                .unwrap_or(1) as u8;
-            cur_level = n.clamp(1, 4);
+            cur_level = level;
             continue;
         }
-        if text.is_empty() {
+        if trimmed.is_empty() {
             buf.push('\n');
         } else {
             if !buf.is_empty() {
                 buf.push('\n');
             }
-            buf.push_str(&text);
+            buf.push_str(&trimmed);
         }
     }
-    if !buf.trim().is_empty() {
-        blocks.push(Block {
-            heading_level: cur_level,
-            title: cur_title,
-            text: buf.trim().to_string(),
-        });
-    }
+    flush(&mut blocks, &cur_title, cur_level, &mut buf);
+    blocks
+}
+
+fn parse_docx(path: &Path) -> Result<Vec<Block>> {
+    let file = fs::File::open(path)?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| {
+        anyhow::anyhow!("不是有效的 .docx，请在 Word 里另存为 .docx（不要用旧版 .doc）：{e}")
+    })?;
+    let mut xml_file = zip.by_name("word/document.xml").map_err(|_| {
+        anyhow::anyhow!("不是有效的 .docx，缺少 word/document.xml，请另存为 .docx")
+    })?;
+    let mut xml = String::new();
+    xml_file.read_to_string(&mut xml)?;
+    drop(xml_file);
+    let blocks = blocks_from_docx_xml(&xml);
     if blocks.is_empty() {
         anyhow::bail!("docx 未抽出文本");
     }
@@ -529,5 +667,137 @@ mod tests {
         let (bytes, _, _) = encoding_rs::GB18030.encode("独眼酒保");
         let s = decode_bytes(&bytes).unwrap();
         assert!(s.contains("独眼酒保"), "{s}");
+    }
+
+    fn write_min_docx(path: &Path, body_xml: &str) {
+        use std::io::Write;
+        let file = fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#,
+        )
+        .unwrap();
+        zip.start_file("_rels/.rels", opts).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#,
+        )
+        .unwrap();
+        zip.start_file("word/document.xml", opts).unwrap();
+        let doc = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>{body_xml}</w:body>
+</w:document>"#
+        );
+        zip.write_all(doc.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn titles(blocks: &[Block]) -> Vec<&str> {
+        blocks.iter().map(|b| b.title.as_str()).collect()
+    }
+
+    #[test]
+    fn docx_heading_and_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("npc.docx");
+        write_min_docx(
+            &path,
+            r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>潮汐帮</w:t></w:r></w:p>
+<w:p><w:r><w:t>势力。港口走私网。</w:t></w:r><w:del><w:r><w:t>不该出现</w:t></w:r></w:del></w:p>
+<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>玛拉（账房）</w:t></w:r></w:p>
+<w:p><w:r><w:t>NPC。潮汐帮管账。</w:t></w:r></w:p>
+<w:tbl><w:tr>
+<w:tc><w:p><w:r><w:t>别名</w:t></w:r></w:p></w:tc>
+<w:tc><w:p><w:r><w:t>账房玛拉、小玛</w:t></w:r></w:p></w:tc>
+</w:tr></w:tbl>"#,
+        );
+        let blocks = parse_file(&path).unwrap();
+        assert!(
+            blocks.iter().any(|b| b.title == "潮汐帮"),
+            "{:?}",
+            titles(&blocks)
+        );
+        let mara = blocks
+            .iter()
+            .find(|b| b.title.contains("玛拉"))
+            .unwrap_or_else(|| panic!("missing heading 2: {:?}", titles(&blocks)));
+        assert!(mara.text.contains("别名：账房玛拉"), "{}", mara.text);
+        assert!(
+            !blocks.iter().any(|b| b.text.contains("不该出现")),
+            "{:?}",
+            blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn docx_chinese_style_and_outline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cn.docx");
+        write_min_docx(
+            &path,
+            r#"<w:p><w:pPr><w:pStyle w:val="标题1"/></w:pPr><w:r><w:t>港口</w:t></w:r></w:p>
+<w:p><w:r><w:t>地点。湿咸的风。</w:t></w:r></w:p>
+<w:p><w:pPr><w:pStyle w:val="2"/><w:outlineLvl w:val="1"/></w:pPr><w:r><w:t>账房</w:t></w:r></w:p>
+<w:p><w:r><w:t>二楼。</w:t></w:r></w:p>
+<w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr><w:r><w:t>潮汐帮</w:t></w:r></w:p>
+<w:p><w:r><w:t>势力。</w:t></w:r></w:p>"#,
+        );
+        let blocks = parse_file(&path).unwrap();
+        assert!(
+            blocks.iter().any(|b| b.title == "港口" && b.heading_level == 1),
+            "{:?}",
+            titles(&blocks)
+        );
+        assert!(
+            blocks.iter().any(|b| b.title == "账房" && b.heading_level == 2),
+            "{:?}",
+            titles(&blocks)
+        );
+        assert!(
+            blocks.iter().any(|b| b.title == "潮汐帮" && b.heading_level == 1),
+            "{:?}",
+            titles(&blocks)
+        );
+    }
+
+    #[test]
+    fn docx_invalid_and_old_doc() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.docx");
+        fs::write(&bad, b"not-a-zip").unwrap();
+        let err = parse_file(&bad).unwrap_err().to_string();
+        assert!(err.contains("另存为"), "{err}");
+        let old = dir.path().join("old.doc");
+        fs::write(&old, b"x").unwrap();
+        let err = parse_file(&old).unwrap_err().to_string();
+        assert!(err.contains(".doc"), "{err}");
+    }
+
+    #[test]
+    fn sample_docx_mara() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/sample-campaign/03-人物.docx");
+        let blocks = parse_file(&path).unwrap();
+        assert!(
+            blocks.iter().any(|b| b.title.contains("玛拉")),
+            "{:?}",
+            titles(&blocks)
+        );
+        assert!(
+            blocks.iter().any(|b| b.text.contains("账房玛拉")),
+            "{:?}",
+            blocks.iter().map(|b| &b.text).collect::<Vec<_>>()
+        );
     }
 }

@@ -28,3 +28,6 @@
 {"query": "玩家会从港口进城", "relevant_chunk_ids": ["战役简介"], "kind": "lexical", "must_extract_any": ["港口进城"]}
 {"query": "那个独眼酒保", "relevant_chunk_ids": ["格里姆（独眼酒保）", "战役简介"], "kind": "lexical", "must_extract_any": ["独眼酒保"]}
 {"query": "AND 格里姆", "relevant_chunk_ids": ["格里姆（独眼酒保）"], "kind": "lexical", "must_extract_any": ["格里姆"]}
+{"query": "玛拉", "relevant_chunk_ids": ["玛拉（账房）"], "kind": "lexical", "must_extract_any": []}
+{"query": "潮汐帮", "relevant_chunk_ids": ["潮汐帮"], "kind": "lexical", "must_extract_any": ["潮汐帮"]}
+{"query": "账房玛拉", "relevant_chunk_ids": ["玛拉（账房）"], "kind": "lexical", "must_extract_any": ["账房玛拉"]}

@@ -7,7 +7,7 @@
 ## 本版做了什么
 
 - `crates/table-canon-core`：SQLite FTS5 trigram + BM25、长口语抽词（A 层 ≥3 字）、拼音（空格全拼 / 连写 / 首字母，含多音字）、简繁静态映射、别名/同义词、`chunk_corrections` 回套、相对路径 + hash 重命名、先删后插、`export_snapshot` 强制 `journal_mode=DELETE`、`open_portable` 不切 WAL、三种复制模板
-- `apps/desktop`：Windows 置顶窗口（egui）。导入文件夹 → 粘贴玩家的话 → 检索 → 一键复制
+- `apps/desktop`：Windows 置顶窗口。点「试用样例」即可检索/复制；自己的模组再新建库导入
 - 样例战役：`testdata/sample-campaign`
 - lexical 门禁：`testdata/eval.jsonl`（≥30 条，Recall@10）
 
@@ -21,21 +21,22 @@
 
 ## 运行
 
-在仓库根目录：
+在仓库根目录双击 `run-demo.bat`，或：
 
 ```bat
-cargo test -p table-canon-core
 cargo run -p table-canon-desktop --release
 ```
 
-桌面程序：
+打开后：
 
-1. **新建库** → 选路径保存 `campaign.tcs`
-2. **导入文件夹** → 选 `testdata/sample-campaign`
-3. 搜索框粘贴：`我们之前在那个独眼酒保的店里拿到了货`
-4. 点 **复制公开**（密谋段应被剥掉）
+1. 点 **试用样例**（自动建库并导入断桅港）
+2. 回车检索预填的那句玩家口语
+3. 点 **复制公开**，或再按 Enter（密谋段应被剥掉）
+4. 方向键可换条。自己的模组用「新建库 / 导入文件夹 / 导入 Word」
 
-也可用 `gelimu`、`老格`、`斷桅酒館` 验证拼音、2 字别名和简繁。
+也可搜 `gelimu`、`老格`、`斷桅酒館`、`玛拉`。
+
+可导入 `.docx`（标题样式 + 段落 + 表格）。旧版 `.doc` 请在 Word 里另存为 `.docx`。试用样例里的人物卡就是 Word。
 
 ## 库文件
 
