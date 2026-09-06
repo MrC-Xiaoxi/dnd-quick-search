@@ -1,4 +1,7 @@
-use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, RichText, ViewportBuilder};
+use eframe::egui::{
+    self, text::LayoutJob, Color32, FontData, FontDefinitions, FontFamily, FontId, RichText,
+    TextFormat, ViewportBuilder,
+};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,8 +9,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use table_canon_core::{
-    Hit, ImportOpts, LlmConfig, LlmSplitter, MetaPatch, SearchResult, Store, StoreInfo,
-    VIS_PUBLIC, VIS_SECRET,
+    Hit, ImportOpts, LlmConfig, LlmSplitter, MetaPatch, SearchResult, Store, StoreInfo, VIS_PUBLIC,
+    VIS_SECRET,
 };
 
 const SAMPLE_QUERY: &str = "我们之前在那个独眼酒保的店里拿到了货";
@@ -59,6 +62,7 @@ struct App {
     expanded: HashSet<i64>,
     llm_enabled: bool,
     import_job: Option<ImportJob>,
+    reading_id: Option<i64>,
 }
 
 impl App {
@@ -82,6 +86,7 @@ impl App {
             expanded: HashSet::new(),
             llm_enabled: load_app_config().llm.enabled,
             import_job: None,
+            reading_id: None,
         };
         if let Some(p) = load_last_store_path() {
             match Store::open(&p) {
@@ -104,6 +109,7 @@ impl App {
         self.store = Some(next);
         self.last = None;
         self.selected = None;
+        self.reading_id = None;
         self.refresh_info();
     }
 
@@ -144,6 +150,7 @@ impl App {
                 self.status = format!("{} ms · 抽词 {} · 命中 {}", r.latency_ms, terms, r.hits.len());
                 self.selected = r.hits.first().map(|h| h.chunk.id);
                 self.expanded.clear();
+                self.reading_id = None;
                 self.last = Some(r);
             }
             Err(e) => self.status = format!("检索失败: {e}"),
@@ -338,17 +345,159 @@ impl App {
         }
     }
 
+    fn open_reader(&mut self, id: i64) {
+        self.reading_id = Some(id);
+        self.selected = Some(id);
+    }
+
+    fn back_to_results(&mut self) {
+        self.reading_id = None;
+    }
+
     fn move_selection(&mut self, delta: i32) {
-        let Some(hits) = self.last.as_ref().map(|l| &l.hits) else { return };
+        let Some(hits) = self.last.as_ref().map(|l| &l.hits) else {
+            return;
+        };
         if hits.is_empty() {
             return;
         }
-        let cur = self
-            .selected
+        let cur_id = self.reading_id.or(self.selected);
+        let cur = cur_id
             .and_then(|id| hits.iter().position(|h| h.chunk.id == id))
             .unwrap_or(0);
         let next = (cur as i32 + delta).clamp(0, hits.len() as i32 - 1) as usize;
-        self.selected = Some(hits[next].chunk.id);
+        let id = hits[next].chunk.id;
+        self.selected = Some(id);
+        if self.reading_id.is_some() {
+            self.reading_id = Some(id);
+        }
+    }
+
+    fn ui_reader(&mut self, ui: &mut egui::Ui, id: i64) {
+        let loaded = {
+            let Some(store) = self.store.as_ref() else {
+                ui.label("库已关闭。");
+                return;
+            };
+            match store.get_chunk(id) {
+                Ok(d) => {
+                    let prev_title = d
+                        .prev_id
+                        .and_then(|pid| store.get_chunk(pid).ok())
+                        .map(|x| x.chunk.title);
+                    let next_title = d
+                        .next_id
+                        .and_then(|nid| store.get_chunk(nid).ok())
+                        .map(|x| x.chunk.title);
+                    Some((d, prev_title, next_title))
+                }
+                Err(e) => {
+                    ui.label(format!("读不到这条原文：{e}"));
+                    None
+                }
+            }
+        };
+        let Some((detail, prev_title, next_title)) = loaded else {
+            return;
+        };
+        let prev_id = detail.prev_id;
+        let next_id = detail.next_id;
+        let hits = self.last.as_ref().map(|l| l.hits.clone()).unwrap_or_default();
+        let hit_i = hits.iter().position(|h| h.chunk.id == id);
+        let hit_n = hits.len();
+        let q = self.query.trim().to_string();
+        let c = detail.chunk;
+
+        ui.horizontal(|ui| {
+            if ui.button("← 返回结果").clicked() {
+                self.back_to_results();
+            }
+            if let Some(i) = hit_i {
+                ui.label(RichText::new(format!("结果 {} / {}", i + 1, hit_n)).weak());
+                if ui
+                    .add_enabled(i > 0, egui::Button::new("上一条结果"))
+                    .clicked()
+                {
+                    self.open_reader(hits[i - 1].chunk.id);
+                }
+                if ui
+                    .add_enabled(i + 1 < hit_n, egui::Button::new("下一条结果"))
+                    .clicked()
+                {
+                    self.open_reader(hits[i + 1].chunk.id);
+                }
+            }
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new(&c.title).color(Color32::from_rgb(232, 196, 104)));
+            ui.label(
+                RichText::new(&c.entity_type).color(Color32::from_rgb(160, 140, 90)),
+            );
+            if c.visibility & VIS_SECRET != 0 {
+                ui.label(RichText::new("SECRET").color(Color32::from_rgb(200, 90, 80)));
+            }
+        });
+        if !c.aliases.is_empty() {
+            ui.label(format!("别名：{}", c.aliases.join(" / ")));
+        }
+        ui.label(
+            RichText::new(format!("{} · {}", c.file_name, c.parent_path))
+                .small()
+                .weak(),
+        );
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("复制公开").clicked() {
+                self.copy(id, "player");
+            }
+            if ui.button("复制全文").clicked() {
+                self.copy(id, "full");
+            }
+            if ui.button("复制来源").clicked() {
+                self.copy(id, "source");
+            }
+            if ui.button("标为秘密").clicked() {
+                if let Some(s) = &self.store {
+                    let _ = s.update_chunk_meta(
+                        id,
+                        MetaPatch {
+                            visibility: Some(c.visibility | VIS_SECRET | VIS_PUBLIC),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+        });
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical()
+            .id_salt("reader-body")
+            .show(ui, |ui| {
+                ui.label(highlight_body(&c.body, &q, 17.0));
+                ui.add_space(16.0);
+                ui.separator();
+                ui.label(RichText::new("原文位置（同一文档相邻条目）").weak());
+                ui.horizontal(|ui| {
+                    if let Some(t) = &prev_title {
+                        if ui.button(format!("上文 · {t}")).clicked() {
+                            if let Some(pid) = prev_id {
+                                self.open_reader(pid);
+                            }
+                        }
+                    } else {
+                        ui.label(RichText::new("没有上文").weak());
+                    }
+                    if let Some(t) = &next_title {
+                        if ui.button(format!("下文 · {t}")).clicked() {
+                            if let Some(nid) = next_id {
+                                self.open_reader(nid);
+                            }
+                        }
+                    } else {
+                        ui.label(RichText::new("没有下文").weak());
+                    }
+                });
+            });
     }
 }
 
@@ -363,9 +512,17 @@ impl eframe::App for App {
         self.poll_import_job(ctx);
 
         let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if escape && self.reading_id.is_some() {
+            self.back_to_results();
+        }
         if enter && !self.search_focused && self.store.is_some() {
             if let Some(id) = self.selected {
-                self.copy(id, "player");
+                if self.reading_id.is_some() {
+                    self.copy(id, "full");
+                } else {
+                    self.open_reader(id);
+                }
             }
         }
         if !self.search_focused {
@@ -380,6 +537,18 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                if self.reading_id.is_some() {
+                    let back = ui.add(
+                        egui::Button::new(
+                            RichText::new("← 返回结果").color(Color32::from_rgb(40, 28, 8)),
+                        )
+                        .fill(Color32::from_rgb(232, 196, 104)),
+                    );
+                    if back.clicked() {
+                        self.back_to_results();
+                    }
+                    ui.separator();
+                }
                 ui.heading(RichText::new("席间索").color(Color32::from_rgb(232, 196, 104)));
                 ui.label(RichText::new("可用小样").color(Color32::GRAY));
                 ui.separator();
@@ -515,6 +684,11 @@ impl eframe::App for App {
             });
             ui.add_space(8.0);
 
+            if let Some(id) = self.reading_id {
+                self.ui_reader(ui, id);
+                return;
+            }
+
             let hits: Vec<Hit> = self.last.as_ref().map(|l| l.hits.clone()).unwrap_or_default();
             let selected = self.selected;
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -549,89 +723,80 @@ impl eframe::App for App {
                     if on {
                         frame = frame.stroke(egui::Stroke::new(1.0, Color32::from_rgb(232, 196, 104)));
                     }
-                    frame.show(ui, |ui| {
+                    let inner = frame.show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(on, RichText::new(&h.chunk.title).strong())
-                                .clicked()
-                            {
-                                self.selected = Some(h.chunk.id);
-                            }
+                            ui.label(RichText::new(&h.chunk.title).strong().size(18.0));
                             ui.label(
-                                RichText::new(&h.chunk.entity_type).color(Color32::from_rgb(160, 140, 90)),
+                                RichText::new(&h.chunk.entity_type)
+                                    .color(Color32::from_rgb(160, 140, 90)),
                             );
                             if h.chunk.visibility & VIS_SECRET != 0 {
-                                ui.label(RichText::new("SECRET").color(Color32::from_rgb(200, 90, 80)));
+                                ui.label(
+                                    RichText::new("SECRET").color(Color32::from_rgb(200, 90, 80)),
+                                );
                             }
-                            ui.label(RichText::new(format!("via {}", h.via.join("+"))).weak());
+                            let q = self.query.trim();
+                            let is_entry = h.via.iter().any(|v| v == "index")
+                                || (!q.is_empty() && h.chunk.title.contains(q));
+                            ui.label(RichText::new(if is_entry { "条目" } else { "正文" }).color(
+                                if is_entry {
+                                    Color32::from_rgb(232, 196, 104)
+                                } else {
+                                    Color32::from_rgb(140, 140, 140)
+                                },
+                            ));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new("点击查看原文").weak().small());
+                            });
                         });
-                        if !h.chunk.aliases.is_empty() {
-                            ui.label(format!("别名：{}", h.chunk.aliases.join(" / ")));
-                        }
-                        let q = self.query.trim();
-                        let is_entry = h.via.iter().any(|v| v == "index")
-                            || (!q.is_empty() && h.chunk.title.contains(q));
-                        let badge = if is_entry { "条目" } else { "正文" };
-                        ui.label(
-                            RichText::new(badge).color(if is_entry {
-                                Color32::from_rgb(232, 196, 104)
-                            } else {
-                                Color32::from_rgb(140, 140, 140)
-                            }),
-                        );
-                        let expanded = self.expanded.contains(&h.chunk.id);
-                        if on {
-                            let (preview, clipped) = snippet_around(&h.chunk.body, q, 280);
-                            if expanded || !clipped {
-                                ui.label(RichText::new(&h.chunk.body).size(16.0));
-                            } else {
-                                ui.label(RichText::new(&preview).size(16.0));
-                                if ui.small_button("展开全文").clicked() {
-                                    self.expanded.insert(h.chunk.id);
-                                }
-                            }
-                        } else {
-                            let (preview, _) = snippet_around(&h.chunk.body, q, 72);
-                            ui.label(RichText::new(preview).weak().size(14.0));
-                        }
+                        let (preview, _) = snippet_around(&h.chunk.body, self.query.trim(), 90);
+                        ui.label(RichText::new(preview).weak().size(14.0));
                         ui.label(
                             RichText::new(format!("{} · {}", h.chunk.file_name, h.chunk.parent_path))
                                 .small()
                                 .weak(),
                         );
-                        if on {
-                            ui.horizontal(|ui| {
-                                if ui.button("复制公开").clicked() {
-                                    self.copy(h.chunk.id, "player");
-                                }
-                                if ui.button("复制全文").clicked() {
-                                    self.copy(h.chunk.id, "full");
-                                }
-                                if ui.button("复制来源").clicked() {
-                                    self.copy(h.chunk.id, "source");
-                                }
-                                if ui.button("标为秘密").clicked() {
-                                    if let Some(s) = &self.store {
-                                        let _ = s.update_chunk_meta(
-                                            h.chunk.id,
-                                            MetaPatch {
-                                                visibility: Some(
-                                                    h.chunk.visibility | VIS_SECRET | VIS_PUBLIC,
-                                                ),
-                                                ..Default::default()
-                                            },
-                                        );
-                                    }
-                                    self.do_search();
-                                }
-                            });
-                        }
                     });
+                    if inner.response.interact(egui::Sense::click()).clicked() {
+                        self.open_reader(h.chunk.id);
+                    }
                     ui.add_space(8.0);
                 }
             });
         });
     }
+}
+
+fn highlight_body(body: &str, query: &str, size: f32) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let normal = TextFormat {
+        font_id: FontId::proportional(size),
+        color: Color32::from_rgb(228, 226, 214),
+        ..Default::default()
+    };
+    let hit = TextFormat {
+        font_id: FontId::proportional(size),
+        color: Color32::from_rgb(40, 28, 8),
+        background: Color32::from_rgb(232, 196, 104),
+        ..Default::default()
+    };
+    let q = query.trim();
+    if q.is_empty() {
+        job.append(body, 0.0, normal);
+        return job;
+    }
+    let mut rest = body;
+    while let Some(i) = rest.find(q) {
+        if i > 0 {
+            job.append(&rest[..i], 0.0, normal.clone());
+        }
+        job.append(q, 0.0, hit.clone());
+        rest = &rest[i + q.len()..];
+    }
+    if !rest.is_empty() {
+        job.append(rest, 0.0, normal);
+    }
+    job
 }
 
 fn snippet_around(body: &str, query: &str, max_chars: usize) -> (String, bool) {
