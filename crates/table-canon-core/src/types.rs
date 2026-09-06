@@ -63,6 +63,9 @@ pub struct ImportReport {
     pub chunks: usize,
     pub unmatched_corrections: usize,
     pub errors: Vec<String>,
+    /// 非致命警告（如「某章拆条失败已回退规则切块」），导入报告里透出。
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -86,6 +89,32 @@ pub struct DraftChunk {
     pub content_hash: String,
 }
 
+fn neg_one() -> i64 {
+    -1
+}
+
+/// 模型给出的段号可能是数字、字符串（"7"、"[7]"、"段7"）甚至 null。
+/// 解析不了就返回 -1（视为未提供），宁可退回 anchor 匹配也不让整个数组解析失败。
+fn deserialize_flex_i64<'de, D>(d: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::Null => -1,
+        serde_json::Value::Number(n) => n.as_i64().unwrap_or(-1),
+        serde_json::Value::String(s) => {
+            let digits: String = s
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            digits.parse().unwrap_or(-1)
+        }
+        _ => -1,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExtractedEntry {
     pub title: String,
@@ -95,9 +124,15 @@ pub struct ExtractedEntry {
     pub entity_type: String,
     #[serde(default)]
     pub body: String,
-    /// 原文中连续出现的短句，框架用它定位切点；可空。
+    /// 旧契约字段：原文中连续出现的短句。段号制下降级为可选校验/兜底匹配手段；可空。
     #[serde(default)]
     pub anchor: String,
+    /// 条目起始全局段号（含），-1 表示未提供。段号由框架编号，定位与模型复写能力解耦。
+    #[serde(default = "neg_one", deserialize_with = "deserialize_flex_i64")]
+    pub start: i64,
+    /// 条目结束全局段号（含），-1 表示未提供。
+    #[serde(default = "neg_one", deserialize_with = "deserialize_flex_i64")]
+    pub end: i64,
     #[serde(default)]
     pub heading_level: u8,
 }
