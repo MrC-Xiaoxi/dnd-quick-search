@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+.idea/
+.vscode/
+*.tcs
+*.tcs-wal
+*.tcs-shm
+*.tcs-journal
+config.toml
+.DS_Store
+Thumbs.db
+node_modules/
+dist/

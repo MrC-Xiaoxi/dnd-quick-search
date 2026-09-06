@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/table-canon-core",
+    "apps/desktop",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+table-canon-core = { path = "crates/table-canon-core" }

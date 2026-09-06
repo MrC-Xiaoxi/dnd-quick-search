@@ -1,0 +1,24 @@
+[package]
+name = "table-canon-core"
+version = "0.1.0"
+edition = "2021"
+description = "席间索检索引擎：导入、抽词、FTS5、修正回套、便携快照"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+encoding_rs = "0.8"
+hex = "0.4"
+pinyin = "0.10"
+regex = "1"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+thiserror = "2"
+walkdir = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"

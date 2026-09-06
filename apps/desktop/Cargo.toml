@@ -1,0 +1,13 @@
+[package]
+name = "table-canon-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "席间索 M1 demo 桌面壳（egui）。方案中的 Tauri 外壳可后续替换，core API 已按文档切开。"
+
+[dependencies]
+table-canon-core = { path = "../../crates/table-canon-core" }
+eframe = "0.31"
+egui = "0.31"
+rfd = "0.15"
+arboard = "3"
+anyhow = "1"
