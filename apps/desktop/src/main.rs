@@ -241,6 +241,9 @@ impl App {
                     if cfg.llm.timeout_secs > 0 {
                         c.timeout_secs = cfg.llm.timeout_secs;
                     }
+                    if cfg.llm.concurrency > 0 {
+                        c.concurrency = cfg.llm.concurrency;
+                    }
                     Some(c)
                 }
                 None => {
@@ -676,6 +679,8 @@ struct LlmSection {
     model: String,
     #[serde(default)]
     timeout_secs: u64,
+    #[serde(default)]
+    concurrency: u32,
 }
 
 fn demo_root() -> PathBuf {
@@ -732,7 +737,8 @@ fn load_app_config() -> AppConfig {
                     base_url: "http://127.0.0.1:8317/v1".into(),
                     api_key: String::new(),
                     model: "gpt-4o-mini".into(),
-                    timeout_secs: 180,
+                    timeout_secs: 60,
+                    concurrency: 3,
                 },
             };
             save_app_config(&cfg);
@@ -748,17 +754,19 @@ fn save_app_config(cfg: &AppConfig) {
     }
     let llm = &cfg.llm;
     let timeout = if llm.timeout_secs == 0 {
-        180
+        60
     } else {
         llm.timeout_secs
     };
+    let conc = if llm.concurrency == 0 { 3 } else { llm.concurrency };
     let text = format!(
-        "# 席间索 AI 配置（仅导入拆条；查询走本地）\nenabled = {}\nbase_url = \"{}\"\napi_key = \"{}\"\nmodel = \"{}\"\ntimeout_secs = {}\n",
+        "# 席间索 AI 配置（仅导入拆条；查询走本地）\n# 拆条请用小模型（如 gpt-4o-mini），不要用 grok-4.6 这类推理模型。\nenabled = {}\nbase_url = \"{}\"\napi_key = \"{}\"\nmodel = \"{}\"\ntimeout_secs = {}\nconcurrency = {}\n",
         llm.enabled,
         llm.base_url.replace('\\', "\\\\").replace('"', "\\\""),
         llm.api_key.replace('\\', "\\\\").replace('"', "\\\""),
         llm.model.replace('\\', "\\\\").replace('"', "\\\""),
-        timeout
+        timeout,
+        conc
     );
     let _ = fs::write(path, text);
 }

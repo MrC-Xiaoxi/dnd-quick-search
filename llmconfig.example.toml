@@ -1,8 +1,10 @@
 # 席间索 AI 配置模板
 # 复制为同目录 llmconfig.toml 后填写。查询不走网络。
+# 拆条请用小模型；grok-4.6 这类推理模型会把导入拖到十几分钟。
 
 enabled = false
 base_url = "http://127.0.0.1:8317/v1"
 api_key = "123456987"
 model = "gpt-4o-mini"
-timeout_secs = 180
+timeout_secs = 60
+concurrency = 3

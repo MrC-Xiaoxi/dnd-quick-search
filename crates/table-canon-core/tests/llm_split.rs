@@ -27,7 +27,7 @@ impl EntrySplitter for MockSplitter {
 fn refine_turns_chapter_into_entries() {
     let body = format!(
         "猎人工会驻扎在熔炉区。登记员每天统计伤亡。{}",
-        "工会的历史悠久，成员遍布城邦各处，负责协调猎魔、悬赏与救援。".repeat(10)
+        "工会的历史悠久，成员遍布城邦各处，负责协调猎魔、悬赏与救援。".repeat(30)
     );
     let blocks = vec![Block {
         heading_level: 1,

@@ -1,9 +1,13 @@
+use crate::normalize::sha1_hex;
 use crate::split::{parse_entries_json, EntrySplitter};
 use crate::types::ExtractedEntry;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
@@ -11,6 +15,8 @@ pub struct LlmConfig {
     pub api_key: String,
     pub model: String,
     pub timeout_secs: u64,
+    pub concurrency: u32,
+    pub max_tokens: u32,
 }
 
 impl LlmConfig {
@@ -25,7 +31,9 @@ impl LlmConfig {
             base_url,
             api_key,
             model,
-            timeout_secs: 180,
+            timeout_secs: 60,
+            concurrency: 3,
+            max_tokens: 2048,
         })
     }
 }
@@ -33,6 +41,9 @@ impl LlmConfig {
 pub struct LlmSplitter {
     cfg: LlmConfig,
     progress: Option<Arc<Mutex<String>>>,
+    started: Instant,
+    done: std::sync::atomic::AtomicUsize,
+    total: std::sync::atomic::AtomicUsize,
 }
 
 impl LlmSplitter {
@@ -40,6 +51,9 @@ impl LlmSplitter {
         Self {
             cfg,
             progress: None,
+            started: Instant::now(),
+            done: std::sync::atomic::AtomicUsize::new(0),
+            total: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -47,6 +61,9 @@ impl LlmSplitter {
         Self {
             cfg,
             progress: Some(progress),
+            started: Instant::now(),
+            done: std::sync::atomic::AtomicUsize::new(0),
+            total: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -58,11 +75,25 @@ impl LlmSplitter {
         }
     }
 
+    fn tick(&self, title: &str) {
+        use std::sync::atomic::Ordering;
+        let done = self.done.fetch_add(1, Ordering::Relaxed) + 1;
+        let total = self.total.load(Ordering::Relaxed).max(1);
+        let sec = self.started.elapsed().as_secs();
+        self.note(format!(
+            "LLM 拆条 {done}/{total} · 「{}」· 已用 {} 分 {:02} 秒",
+            truncate(title, 18),
+            sec / 60,
+            sec % 60
+        ));
+    }
+
     fn chat(&self, user: &str) -> Result<String> {
         let url = format!("{}/chat/completions", self.cfg.base_url);
         let body = json!({
             "model": self.cfg.model,
-            "temperature": 0.2,
+            "temperature": 0.1,
+            "max_tokens": self.cfg.max_tokens.max(256),
             "messages": [
                 {"role": "system", "content": SYSTEM},
                 {"role": "user", "content": user}
@@ -71,7 +102,7 @@ impl LlmSplitter {
         let resp: ChatResponse = ureq::post(&url)
             .set("Authorization", &format!("Bearer {}", self.cfg.api_key))
             .set("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(self.cfg.timeout_secs.max(30)))
+            .timeout(std::time::Duration::from_secs(self.cfg.timeout_secs.max(20)))
             .send_json(body)
             .with_context(|| format!("调用 LLM 失败: {url}"))?
             .into_json()
@@ -86,36 +117,140 @@ impl LlmSplitter {
         }
         Ok(text)
     }
+
+    fn cached_split(&self, title: &str, piece: &str, idx: usize) -> Result<Vec<ExtractedEntry>> {
+        let user = format!("章节标题：{title}\n分段序号：{}\n正文：\n{piece}", idx + 1);
+        let key = sha1_hex(&format!("{}|{title}|{idx}|{piece}", self.cfg.model));
+        let path = cache_dir().join(format!("{key}.json"));
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(entries) = parse_entries_json(&raw) {
+                return Ok(entries);
+            }
+        }
+        let raw = self.chat(&user)?;
+        let entries = parse_entries_json(&raw)?;
+        let _ = fs::create_dir_all(cache_dir());
+        let _ = fs::write(path, raw);
+        Ok(entries)
+    }
 }
 
 impl EntrySplitter for LlmSplitter {
     fn split_chapter(&self, chapter_title: &str, body: &str) -> Result<Vec<ExtractedEntry>> {
-        let mut out = Vec::new();
-        let pieces = split_for_context(body, 4500);
-        let n = pieces.len();
-        for (i, piece) in pieces.into_iter().enumerate() {
-            self.note(format!(
-                "LLM 拆条「{}」({}/{})，窗口可继续点，请等本段返回…",
-                if chapter_title.is_empty() {
-                    "未命名"
+        let pieces = split_for_context(body, 3200);
+        self.total
+            .store(pieces.len(), std::sync::atomic::Ordering::Relaxed);
+        self.split_pieces(chapter_title, &pieces)
+    }
+
+    fn split_many(&self, chapters: &[(String, String)]) -> Vec<Result<Vec<ExtractedEntry>>> {
+        let mut jobs: Vec<(usize, usize, String, String)> = Vec::new();
+        for (ci, (title, body)) in chapters.iter().enumerate() {
+            for (pi, piece) in split_for_context(body, 3200).into_iter().enumerate() {
+                jobs.push((ci, pi, title.clone(), piece));
+            }
+        }
+        self.total
+            .store(jobs.len(), std::sync::atomic::Ordering::Relaxed);
+        self.done
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        if jobs.is_empty() {
+            return chapters.iter().map(|_| Ok(Vec::new())).collect();
+        }
+        let workers = (self.cfg.concurrency.max(1) as usize).min(jobs.len());
+        let piece_results = par_map(jobs, workers, |(ci, pi, title, piece)| {
+            let r = self.cached_split(&title, &piece, pi);
+            self.tick(&title);
+            (ci, r)
+        });
+        let mut buckets: Vec<Vec<ExtractedEntry>> = vec![Vec::new(); chapters.len()];
+        let mut first_err: Vec<Option<String>> = vec![None; chapters.len()];
+        for (ci, r) in piece_results {
+            match r {
+                Ok(mut entries) => buckets[ci].append(&mut entries),
+                Err(e) => {
+                    if first_err[ci].is_none() {
+                        first_err[ci] = Some(e.to_string());
+                    }
+                }
+            }
+        }
+        buckets
+            .into_iter()
+            .zip(first_err)
+            .map(|(v, err)| {
+                if v.is_empty() {
+                    Err(anyhow::anyhow!(
+                        "{}",
+                        err.unwrap_or_else(|| "LLM 未拆出任何条目".into())
+                    ))
                 } else {
-                    chapter_title
-                },
-                i + 1,
-                n
-            ));
-            let user = format!(
-                "章节标题：{chapter_title}\n分段序号：{}\n正文：\n{piece}",
-                i + 1
-            );
-            let raw = self.chat(&user)?;
-            out.extend(parse_entries_json(&raw)?);
+                    Ok(v)
+                }
+            })
+            .collect()
+    }
+}
+
+impl LlmSplitter {
+    fn split_pieces(&self, chapter_title: &str, pieces: &[String]) -> Result<Vec<ExtractedEntry>> {
+        let jobs: Vec<(usize, String)> = pieces
+            .iter()
+            .cloned()
+            .enumerate()
+            .collect();
+        let workers = (self.cfg.concurrency.max(1) as usize).min(jobs.len().max(1));
+        let results = par_map(jobs, workers, |(i, piece)| {
+            let r = self.cached_split(chapter_title, &piece, i);
+            self.tick(chapter_title);
+            r
+        });
+        let mut out = Vec::new();
+        let mut last_err = None;
+        for r in results {
+            match r {
+                Ok(mut v) => out.append(&mut v),
+                Err(e) => last_err = Some(e),
+            }
         }
         if out.is_empty() {
-            bail!("LLM 未拆出任何条目");
+            return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("LLM 未拆出任何条目")));
         }
         Ok(out)
     }
+}
+
+fn par_map<T, R>(items: Vec<T>, workers: usize, f: impl Fn(T) -> R + Sync) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+{
+    let n = items.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let workers = workers.max(1).min(n);
+    if workers == 1 {
+        return items.into_iter().map(f).collect();
+    }
+    let queue = Mutex::new(items.into_iter().enumerate());
+    let out = Mutex::new(Vec::<(usize, R)>::new());
+    std::thread::scope(|s| {
+        let f = &f;
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let next = queue.lock().ok().and_then(|mut q| q.next());
+                let Some((i, item)) = next else { break };
+                let r = f(item);
+                if let Ok(mut g) = out.lock() {
+                    g.push((i, r));
+                }
+            });
+        }
+    });
+    let mut got = out.into_inner().unwrap_or_default();
+    got.sort_by_key(|(i, _)| *i);
+    got.into_iter().map(|(_, r)| r).collect()
 }
 
 fn split_for_context(body: &str, max_chars: usize) -> Vec<String> {
@@ -138,16 +273,31 @@ fn split_for_context(body: &str, max_chars: usize) -> Vec<String> {
     parts
 }
 
-const SYSTEM: &str = r#"你是跑团资料库的归档员。把用户给出的一章模组/私设正文，拆成「一条设定一张卡片」。
+fn cache_dir() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("table-canon")
+        .join("split-cache")
+}
 
-规则：
-1. 每张卡片对应一个可检索条目：NPC、地点、势力、物品、规则、剧情线索等。
-2. 卡片正文必须完整、可直接复制给 DM 使用，不要只写摘要。秘密信息单独起行，以【秘密】开头。
-3. 标题用短专名（如「猎人工会」「格里姆」），不要用「第0章 故事和背景介绍」这种章名当唯一条目，除非整章确实只有一个主题。
-4. 别名包括简称、英文名、玩家可能的叫法。
-5. entity_type 只能是 npc、location、item、faction、rule、plot 之一；不确定就省略。
-6. 只输出 JSON 数组，不要 markdown，不要解释。格式：
-[{"title":"...","aliases":["..."],"entity_type":"faction","body":"..."}]
+fn truncate(s: &str, n: usize) -> String {
+    let t: String = s.chars().take(n).collect();
+    if s.chars().count() > n {
+        format!("{t}…")
+    } else {
+        t
+    }
+}
+
+const SYSTEM: &str = r#"你是跑团资料库归档员。把一章正文切成可检索条目。
+
+硬性规则：
+1. 只剪切原文，禁止扩写、禁止改写、禁止总结。body 必须是原文连续片段。
+2. 一条一个专名（NPC/地点/势力/物品/规则/线索）。标题用短专名，不要用「第N章」当标题。
+3. 别名含简称、英文、口头叫法。entity_type 只能是 npc location item faction rule plot，不确定就省略。
+4. 秘密原文单独成行，以【秘密】开头。
+5. 只输出 JSON 数组：[{"title":"...","aliases":["..."],"entity_type":"faction","body":"..."}]
 "#;
 
 #[derive(Deserialize)]

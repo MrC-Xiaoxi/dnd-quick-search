@@ -7,6 +7,14 @@ use std::collections::HashSet;
 pub trait EntrySplitter: Send + Sync {
     /// 把一章正文拆成若干设定条目。失败则调用方保留启发式切块。
     fn split_chapter(&self, chapter_title: &str, body: &str) -> Result<Vec<ExtractedEntry>>;
+
+    /// 多章并行拆条。默认逐章调用 `split_chapter`。
+    fn split_many(&self, chapters: &[(String, String)]) -> Vec<Result<Vec<ExtractedEntry>>> {
+        chapters
+            .iter()
+            .map(|(t, b)| self.split_chapter(t, b))
+            .collect()
+    }
 }
 
 pub fn parse_entries_json(raw: &str) -> Result<Vec<ExtractedEntry>> {
@@ -64,7 +72,7 @@ fn normalize_entry(mut e: ExtractedEntry) -> ExtractedEntry {
     e
 }
 
-/// 对启发式切出的章再精炼。短块不调用拆条器。
+/// 对启发式切出的章再精炼。短块、已是专名的条目不调用拆条器。
 pub fn refine_drafts(
     blocks: &[Block],
     file_stem: &str,
@@ -73,47 +81,101 @@ pub fn refine_drafts(
     let Some(splitter) = splitter else {
         return (blocks_to_drafts(blocks, file_stem), Vec::new());
     };
+    let coalesced = coalesce_same_title(blocks);
     let mut drafts = Vec::new();
     let mut notes = Vec::new();
     let mut used_keys = HashSet::new();
     let mut ordinal = 0i64;
-    for b in blocks {
-        let body_len = b.text.chars().count();
-        if body_len < 240 {
-            push_heuristic(&mut drafts, &mut used_keys, file_stem, b, &mut ordinal);
-            continue;
+
+    let mut keep: Vec<Block> = Vec::new();
+    let mut llm_idx: Vec<usize> = Vec::new();
+    let mut llm_ch: Vec<(String, String)> = Vec::new();
+    for b in coalesced {
+        if should_llm(&b) {
+            llm_idx.push(keep.len());
+            llm_ch.push((b.title.clone(), b.text.clone()));
+            keep.push(b);
+        } else {
+            keep.push(b);
         }
-        match splitter.split_chapter(&b.title, &b.text) {
-            Ok(entries) if entries.len() >= 2 || body_len > 800 => {
-                for e in entries {
+    }
+    let llm_out = if llm_ch.is_empty() {
+        Vec::new()
+    } else {
+        splitter.split_many(&llm_ch)
+    };
+    let mut llm_iter = llm_out.into_iter();
+    for (i, b) in keep.into_iter().enumerate() {
+        if llm_idx.first() == Some(&i) {
+            llm_idx.remove(0);
+            let body_len = b.text.chars().count();
+            match llm_iter.next() {
+                Some(Ok(entries)) if entries.len() >= 2 || body_len > 800 => {
+                    for e in entries {
+                        push_extracted(
+                            &mut drafts,
+                            &mut used_keys,
+                            file_stem,
+                            &b.title,
+                            e,
+                            &mut ordinal,
+                        );
+                    }
+                }
+                Some(Ok(entries)) if entries.len() == 1 => {
                     push_extracted(
                         &mut drafts,
                         &mut used_keys,
                         file_stem,
                         &b.title,
-                        e,
+                        entries.into_iter().next().unwrap(),
                         &mut ordinal,
                     );
                 }
+                Some(Ok(_)) => push_heuristic(&mut drafts, &mut used_keys, file_stem, &b, &mut ordinal),
+                Some(Err(err)) => {
+                    notes.push(format!("「{}」拆条失败，已用规则切开：{err}", b.title));
+                    push_heuristic(&mut drafts, &mut used_keys, file_stem, &b, &mut ordinal);
+                }
+                None => push_heuristic(&mut drafts, &mut used_keys, file_stem, &b, &mut ordinal),
             }
-            Ok(entries) if entries.len() == 1 => {
-                push_extracted(
-                    &mut drafts,
-                    &mut used_keys,
-                    file_stem,
-                    &b.title,
-                    entries.into_iter().next().unwrap(),
-                    &mut ordinal,
-                );
-            }
-            Ok(_) => push_heuristic(&mut drafts, &mut used_keys, file_stem, b, &mut ordinal),
-            Err(err) => {
-                notes.push(format!("「{}」拆条失败，已用规则切开：{err}", b.title));
-                push_heuristic(&mut drafts, &mut used_keys, file_stem, b, &mut ordinal);
-            }
+        } else {
+            push_heuristic(&mut drafts, &mut used_keys, file_stem, &b, &mut ordinal);
         }
     }
     (drafts, notes)
+}
+
+fn coalesce_same_title(blocks: &[Block]) -> Vec<Block> {
+    let mut out: Vec<Block> = Vec::new();
+    for b in blocks {
+        if let Some(last) = out.last_mut() {
+            if !b.title.is_empty() && last.title == b.title {
+                last.text.push('\n');
+                last.text.push_str(&b.text);
+                continue;
+            }
+        }
+        out.push(b.clone());
+    }
+    out
+}
+
+fn should_llm(b: &Block) -> bool {
+    let n = b.text.chars().count();
+    if n < 800 {
+        return false;
+    }
+    let chapterish = looks_like_chapter_title(&b.title);
+    if !chapterish && n < 2200 {
+        return false;
+    }
+    true
+}
+
+fn looks_like_chapter_title(t: &str) -> bool {
+    let t = t.trim();
+    t.starts_with('第') || t.contains('章') || t.contains('节') || t.contains('回')
 }
 
 fn push_heuristic(
