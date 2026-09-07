@@ -27,7 +27,8 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\TableCanon"
 set "DIR=%~dp0"
 echo 正在删除程序文件...
 if exist "%DIR%testdata" rd /s /q "%DIR%testdata" >nul 2>&1
-del /f /q "%DIR%席间索.exe" "%DIR%llmconfig.example.toml" "%DIR%使用说明.txt" >nul 2>&1
+if exist "%DIR%models" rd /s /q "%DIR%models" >nul 2>&1
+del /f /q "%DIR%席间索.exe" "%DIR%llmconfig.example.toml" "%DIR%使用说明.txt" "%DIR%onnxruntime.dll" >nul 2>&1
 
 echo.
 echo 卸载完成。如目录中还有剩余文件（例如你自己改过的 llmconfig.toml），可手动删除。

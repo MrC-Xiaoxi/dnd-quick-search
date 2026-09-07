@@ -45,6 +45,8 @@ copy /y "%SRCDIR%llmconfig.example.toml" "%TARGET%\" >nul
 if exist "%SRCDIR%使用说明.txt" copy /y "%SRCDIR%使用说明.txt" "%TARGET%\" >nul
 if exist "%SRCDIR%卸载席间索.bat" copy /y "%SRCDIR%卸载席间索.bat" "%TARGET%\" >nul
 if exist "%SRCDIR%testdata" robocopy "%SRCDIR%testdata" "%TARGET%\testdata" /e /nfl /ndl /njh >nul
+if exist "%SRCDIR%models" robocopy "%SRCDIR%models" "%TARGET%\models" /e /nfl /ndl /njh >nul
+if exist "%SRCDIR%onnxruntime.dll" copy /y "%SRCDIR%onnxruntime.dll" "%TARGET%\" >nul
 
 echo 正在创建快捷方式（桌面 + 开始菜单）...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$w=New-Object -ComObject WScript.Shell; $d=[Environment]::GetFolderPath('Desktop'); $l=$w.CreateShortcut($d+'\席间索.lnk'); $l.TargetPath='%TARGET%\席间索.exe'; $l.WorkingDirectory='%TARGET%'; $l.Description='席间索 - 跑团资料席间检索'; $l.Save(); $p=$env:APPDATA+'\Microsoft\Windows\Start Menu\Programs\席间索.lnk'; $l2=$w.CreateShortcut($p); $l2.TargetPath='%TARGET%\席间索.exe'; $l2.WorkingDirectory='%TARGET%'; $l2.Save()"

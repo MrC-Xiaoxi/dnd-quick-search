@@ -1,4 +1,4 @@
-﻿﻿# 席间索 Windows 发布打包脚本
+﻿﻿﻿# 席间索 Windows 发布打包脚本
 # 用法: powershell -NoProfile -ExecutionPolicy Bypass -File packaging\package-release.ps1
 # 产物: dist\席间索-v<版本>-win64.zip（解压即用；内含安装/卸载脚本）
 # 说明:
@@ -55,6 +55,22 @@ try {
     Copy-Item "packaging\使用说明.txt" $stage
     Copy-Item "testdata\sample-campaign" (Join-Path $stage "testdata\sample-campaign") -Recurse -Force
     Copy-Item "README.md" $stage -ErrorAction SilentlyContinue
+
+    # M2 语义检索：模型 + ONNX Runtime 进包（缺失则打包纯词法版并提示）
+    if ((Test-Path "models\bge-small-zh-v1.5\model.onnx") -and (Test-Path "models\bge-small-zh-v1.5\tokenizer.json")) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $stage "models\bge-small-zh-v1.5") | Out-Null
+        Copy-Item "models\bge-small-zh-v1.5\model.onnx" (Join-Path $stage "models\bge-small-zh-v1.5\model.onnx")
+        Copy-Item "models\bge-small-zh-v1.5\tokenizer.json" (Join-Path $stage "models\bge-small-zh-v1.5\tokenizer.json")
+        Write-Host "  语义模型已入包"
+    } else {
+        Write-Host "  [提示] models\bge-small-zh-v1.5 缺失，本包不含语义检索（bash scripts/fetch-model.sh 可下载）"
+    }
+    if (Test-Path "models\onnxruntime\onnxruntime.dll") {
+        Copy-Item "models\onnxruntime\onnxruntime.dll" (Join-Path $stage "onnxruntime.dll")
+        Write-Host "  onnxruntime.dll 已入包"
+    } else {
+        Write-Host "  [提示] models\onnxruntime\onnxruntime.dll 缺失，语义不可用"
+    }
 
     # 4) 压缩
     $zip = Join-Path $root "dist\席间索-v$ver-win64.zip"
