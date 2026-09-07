@@ -20,6 +20,9 @@ thiserror = "2"
 ureq = { version = "2.12", features = ["json"] }
 walkdir = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# M2 语义检索：ONNX Runtime 绑定（load-dynamic：DLL 由程序侧携带，规避 GitHub 下载源）
+ort = { version = "=2.0.0-rc.10", features = ["load-dynamic"] }
+tokenizers = "0.21"
 
 [dev-dependencies]
 tempfile = "3"

@@ -13,3 +13,4 @@ llmconfig
 Thumbs.db
 node_modules/
 dist/
+models/
