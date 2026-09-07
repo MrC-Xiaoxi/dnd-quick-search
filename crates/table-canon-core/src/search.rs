@@ -3,13 +3,20 @@ use crate::normalize::{hanzi_count, now_rfc3339};
 use crate::terms::{extract_terms, extract_terms_relaxed, unescape_fts_term};
 use crate::types::{Chunk, Hit, SearchResult};
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 pub struct SearchQuery<'a> {
     pub text: &'a str,
+    /// 语义编码器：None 或模型未就绪/不一致时自动降级纯词法（§7.3）。
+    pub embed: Option<&'a crate::embed::Embedder>,
 }
+
+/// §8：查询向量预算 800ms，超时丢语义。
+const SEMANTIC_BUDGET_MS: u128 = 800;
+/// §7.5：向量路 top 50 再进 RRF。
+const SEMANTIC_TOP_K: usize = 50;
 
 const RRF_K: f64 = 60.0;
 const HARD_TIMEOUT_MS: u128 = 4500;
@@ -92,6 +99,20 @@ pub fn search(conn: &Connection, campaign_id: i64, q: SearchQuery<'_>) -> Result
         run_fts(conn, campaign_id, &pinyin_terms, 30, &mut ranks);
     }
 
+    // M2 语义路（§6.5/§7.5/§8）：向量 top50 → 每 chunk 最好子块 rank → RRF w=1.0
+    let mut used_semantic = false;
+    if let Some(e) = q.embed {
+        if !timed_out(started) {
+            if let Ok(list) = semantic_chunk_ranks(conn, campaign_id, e, &q0) {
+                for (i, id) in list.iter().enumerate() {
+                    add_rank(&mut ranks, *id, i, 1.0, "semantic");
+                }
+                used_semantic = !list.is_empty();
+            }
+            // 失败（模型不一致/编码失败/超时）→ 当次降级，词法结果照出
+        }
+    }
+
     let mut scored: Vec<(i64, f64, Vec<String>)> =
         ranks.into_iter().map(|(id, (s, v))| (id, s, v)).collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -131,8 +152,14 @@ pub fn search(conn: &Connection, campaign_id: i64, q: SearchQuery<'_>) -> Result
     let latency_ms = started.elapsed().as_millis();
     let _ = conn.execute(
         "INSERT INTO query_log(campaign_id, query, latency_ms, used_semantic, created_at)
-         VALUES(?1,?2,?3,0,?4)",
-        params![campaign_id, q.text, latency_ms as i64, now_rfc3339()],
+         VALUES(?1,?2,?3,?4,?5)",
+        params![
+            campaign_id,
+            q.text,
+            latency_ms as i64,
+            used_semantic as i64,
+            now_rfc3339()
+        ],
     );
     let _ = conn.execute(
         "DELETE FROM query_log WHERE campaign_id=?1 AND id NOT IN (
@@ -150,10 +177,58 @@ pub fn search(conn: &Connection, campaign_id: i64, q: SearchQuery<'_>) -> Result
     Ok(SearchResult {
         hits,
         latency_ms,
-        used_semantic: false,
+        used_semantic,
         truncated: latency_ms >= HARD_TIMEOUT_MS,
         terms: shown_terms,
     })
+}
+
+/// 语义路：模型校验 → 查询向量（预算内）→ 全量子块点积 → 每 chunk 最好分 → top K。
+/// 任何一步失败都返回 Err，由调用方降级纯词法（§7.3）。
+fn semantic_chunk_ranks(
+    conn: &Connection,
+    campaign_id: i64,
+    e: &crate::embed::Embedder,
+    query: &str,
+) -> Result<Vec<i64>> {
+    // embedding_meta 强校验：换过模型的库必须重算后才可信
+    let meta: Option<String> = conn
+        .query_row("SELECT model_id FROM embedding_meta WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if meta.as_deref() != Some(e.model_id()) {
+        anyhow::bail!("语义模型与库内向量不一致");
+    }
+    let t0 = Instant::now();
+    let qv = e.encode_query(query)?;
+    if t0.elapsed().as_millis() > SEMANTIC_BUDGET_MS {
+        anyhow::bail!("查询向量超出 {}ms 预算", SEMANTIC_BUDGET_MS);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT chunk_id, embedding FROM embedding_chunks WHERE campaign_id=?1",
+    )?;
+    let rows = stmt.query_map(params![campaign_id], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+    // §6.5：同一 chunk 只取最好子块分，禁止靠块数刷分
+    let mut best: HashMap<i64, f32> = HashMap::new();
+    for r in rows {
+        let (cid, blob) = r?;
+        let v = crate::embed::blob_to_vec(&blob);
+        if v.len() != crate::embed::EMBED_DIM {
+            continue;
+        }
+        let s = crate::embed::dot(&qv, &v);
+        let slot = best.entry(cid).or_insert(f32::NEG_INFINITY);
+        if s > *slot {
+            *slot = s;
+        }
+    }
+    let mut pairs: Vec<(i64, f32)> = best.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    pairs.truncate(SEMANTIC_TOP_K);
+    Ok(pairs.into_iter().map(|(id, _)| id).collect())
 }
 
 fn contains_boost(chunk: &Chunk, q: &str) -> f64 {

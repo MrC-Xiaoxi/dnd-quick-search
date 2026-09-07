@@ -19,6 +19,8 @@ pub struct Store {
 pub struct ImportOpts<'a> {
     pub splitter: Option<&'a dyn EntrySplitter>,
     pub reprocess: bool,
+    /// 语义编码器：有则导入期计算子块向量（§7.2）；无则不写 embedding_chunks（§7.6）。
+    pub embedder: Option<&'a crate::embed::Embedder>,
 }
 
 impl Store {
@@ -112,11 +114,21 @@ impl Store {
             [self.campaign_id],
             |r| r.get(0),
         )?;
+        let semantic_ready: bool = self
+            .conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM embedding_meta) > 0
+                     AND (SELECT COUNT(*) FROM embedding_chunks WHERE campaign_id=?1) > 0",
+                params![self.campaign_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v != 0)
+            .unwrap_or(false);
         Ok(StoreInfo {
             campaign_id: self.campaign_id,
             campaign_name: name,
             chunk_count,
-            semantic_ready: false,
+            semantic_ready,
         })
     }
 
@@ -265,7 +277,7 @@ impl Store {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| file_name.clone());
-        let (mut drafts, notes) = refine_drafts(&blocks, &stem, opts.splitter);
+        let (mut drafts, mut notes) = refine_drafts(&blocks, &stem, opts.splitter);
 
         let tx = self.conn.unchecked_transaction()?;
 
@@ -340,8 +352,33 @@ impl Store {
 
         tx.execute("DELETE FROM chunks WHERE source_document_id=?1", [doc_id])?;
 
+        // 语义向量导入期计算（§7.2）：编码在事务外做（慢），写库在事务内（快）。
+        // 单条失败只影响该条向量，不阻断导入。
+        let mut vec_rows: Vec<(usize, i64, String, Vec<u8>)> = Vec::new();
+        if let Some(e) = opts.embedder {
+            let mut first_err: Option<String> = None;
+            'enc: for (di, d) in drafts.iter().enumerate() {
+                for (seq, sub) in crate::embed::split_subblocks(&d.body).into_iter().enumerate() {
+                    match e.encode_doc(&sub) {
+                        Ok(v) => vec_rows.push((di, seq as i64, sub.clone(), crate::embed::vec_to_blob(&v))),
+                        Err(err) => {
+                            first_err.get_or_insert_with(|| {
+                                format!("「{}」语义向量计算失败，该条暂无向量：{err}", d.title)
+                            });
+                            vec_rows.retain(|r| r.0 != di);
+                            continue 'enc;
+                        }
+                    }
+                }
+            }
+            if let Some(msg) = first_err {
+                notes.push(msg);
+            }
+        }
+
         let now = now_rfc3339();
         let n = drafts.len();
+        let mut chunk_ids: Vec<i64> = Vec::with_capacity(n);
         for d in drafts {
             let aliases_json = serde_json::to_string(&d.aliases)?;
             let search_text = build_search_text(&d.title, &d.body, &d.aliases, &[]);
@@ -368,6 +405,19 @@ impl Store {
                     now
                 ],
             )?;
+            chunk_ids.push(tx.last_insert_rowid());
+        }
+        if !vec_rows.is_empty() {
+            if ensure_embedding_meta(&tx, opts.embedder)? {
+                notes.push("语义模型已切换，旧向量已清空，其余文档将按需补算".into());
+            }
+            for (di, seq, sub, blob) in vec_rows {
+                tx.execute(
+                    "INSERT INTO embedding_chunks(campaign_id, chunk_id, seq, body, embedding)
+                     VALUES(?1,?2,?3,?4,?5)",
+                    params![self.campaign_id, chunk_ids[di], seq, sub, blob],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(ImportOne::Done {
@@ -378,7 +428,79 @@ impl Store {
     }
 
     pub fn search(&self, query: &str) -> Result<SearchResult> {
-        search::search(&self.conn, self.campaign_id, SearchQuery { text: query })
+        self.search_with(query, None)
+    }
+
+    /// 带语义编码器的检索：`embedder=None` 或模型未就绪时自动降级纯词法（§7.3）。
+    pub fn search_with(
+        &self,
+        query: &str,
+        embedder: Option<&crate::embed::Embedder>,
+    ) -> Result<SearchResult> {
+        search::search(
+            &self.conn,
+            self.campaign_id,
+            SearchQuery {
+                text: query,
+                embed: embedder,
+            },
+        )
+    }
+
+    /// 给缺向量的条目补算（§7.2：模型预热晚于导入时）。返回补算条目数与警告。
+    pub fn backfill_embeddings(
+        &self,
+        e: &crate::embed::Embedder,
+        progress: Option<&std::sync::Mutex<String>>,
+    ) -> Result<(usize, Vec<String>)> {
+        let mut notes = Vec::new();
+        let tx = self.conn.unchecked_transaction()?;
+        if ensure_embedding_meta(&tx, Some(e))? {
+            notes.push("语义模型已切换，旧向量已清空并全量重算".into());
+        }
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT c.id, c.body FROM chunks c
+                 WHERE c.campaign_id=?1
+                   AND NOT EXISTS (SELECT 1 FROM embedding_chunks ec WHERE ec.chunk_id=c.id)",
+            )?;
+            let it = stmt.query_map(params![self.campaign_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+            it.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let total = rows.len();
+        for (k, (cid, body)) in rows.into_iter().enumerate() {
+            let mut buf: Vec<(i64, String, Vec<u8>)> = Vec::new();
+            let mut failed = false;
+            for (seq, sub) in crate::embed::split_subblocks(&body).into_iter().enumerate() {
+                match e.encode_doc(&sub) {
+                    Ok(v) => buf.push((seq as i64, sub, crate::embed::vec_to_blob(&v))),
+                    Err(err) => {
+                        notes.push(format!("条目 {cid} 向量计算失败，已跳过：{err}"));
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            if failed {
+                continue;
+            }
+            for (seq, sub, blob) in buf {
+                tx.execute(
+                    "INSERT INTO embedding_chunks(campaign_id, chunk_id, seq, body, embedding)
+                     VALUES(?1,?2,?3,?4,?5)",
+                    params![self.campaign_id, cid, seq, sub, blob],
+                )?;
+            }
+            if let Some(p) = progress {
+                if let Ok(mut g) = p.lock() {
+                    *g = format!("语义向量补算 {}/{total} 条…", k + 1);
+                }
+            }
+        }
+        tx.commit()?;
+        Ok((total, notes))
     }
 
     pub fn get_chunk(&self, id: i64) -> Result<ChunkDetail> {
@@ -501,6 +623,52 @@ impl Store {
         )?;
         let rows = stmt.query_map([self.campaign_id], |r| r.get::<_, String>(0))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+}
+
+/// 校验/写入 embedding_meta（§文档：两端模型强校验）。
+/// 返回 true 表示模型相对库中记录发生了切换，且旧向量已被清空。
+fn ensure_embedding_meta(
+    conn: &rusqlite::Connection,
+    e: Option<&crate::embed::Embedder>,
+) -> Result<bool> {
+    let Some(e) = e else {
+        return Ok(false);
+    };
+    let existing: Option<String> = conn
+        .query_row("SELECT model_id FROM embedding_meta WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    match existing {
+        None => {
+            conn.execute(
+                "INSERT INTO embedding_meta(id, model_id, model_version, dim, quant, runtime, pooling, query_prefix)
+                 VALUES(1,?1,'1',?2,?3,'onnx','cls',?4)",
+                params![
+                    e.model_id(),
+                    crate::embed::EMBED_DIM as i64,
+                    crate::embed::META_QUANT,
+                    crate::embed::QUERY_PREFIX
+                ],
+            )?;
+            Ok(false)
+        }
+        Some(id) if id == e.model_id() => Ok(false),
+        Some(old) => {
+            conn.execute("DELETE FROM embedding_chunks", [])?;
+            conn.execute(
+                "UPDATE embedding_meta SET model_id=?1, model_version='1', dim=?2, quant=?3, runtime='onnx', pooling='cls', query_prefix=?4 WHERE id=1",
+                params![
+                    e.model_id(),
+                    crate::embed::EMBED_DIM as i64,
+                    crate::embed::META_QUANT,
+                    crate::embed::QUERY_PREFIX
+                ],
+            )?;
+            let _ = old;
+            Ok(true)
+        }
     }
 }
 
