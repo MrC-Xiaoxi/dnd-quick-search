@@ -15,6 +15,17 @@ use table_canon_core::{
     Hit, ImportOpts, LlmConfig, LlmSplitter, MetaPatch, SearchResult, Store, StoreInfo, VIS_PUBLIC,
     VIS_SECRET,
 };
+use table_canon_core::embed::{default_dll_path, default_model_dir, Embedder};
+
+/// M2 语义检索状态（§7.3 预热与降级）。
+#[derive(Clone)]
+enum SemanticState {
+    /// 机器上没有模型文件，语义天然关闭。
+    Idle,
+    Loading,
+    Ready(Arc<Embedder>),
+    Failed(String),
+}
 
 const SAMPLE_QUERY: &str = "我们之前在那个独眼酒保的店里拿到了货";
 
@@ -66,6 +77,7 @@ struct App {
     llm_enabled: bool,
     import_job: Option<ImportJob>,
     reading_id: Option<i64>,
+    semantic: Arc<Mutex<SemanticState>>,
 }
 
 impl App {
@@ -90,7 +102,9 @@ impl App {
             llm_enabled: load_app_config().llm.enabled,
             import_job: None,
             reading_id: None,
+            semantic: Arc::new(Mutex::new(SemanticState::Loading)),
         };
+        app.start_semantic_prewarm();
         if let Some(p) = load_last_store_path() {
             match Store::open(&p) {
                 Ok(s) => {
@@ -128,6 +142,48 @@ impl App {
         }
     }
 
+    /// §7.3 预热：启动即后台加载 ONNX，不挡主窗；失败永久降级到关键词。
+    fn start_semantic_prewarm(&mut self) {
+        let state = self.semantic.clone();
+        thread::spawn(move || {
+            let Some(model_dir) = default_model_dir() else {
+                if let Ok(mut g) = state.lock() {
+                    *g = SemanticState::Idle;
+                }
+                return;
+            };
+            let dll = default_dll_path();
+            match Embedder::load(&model_dir, dll.as_deref()) {
+                Ok(e) => {
+                    if let Ok(mut g) = state.lock() {
+                        *g = SemanticState::Ready(Arc::new(e));
+                    }
+                }
+                Err(err) => {
+                    if let Ok(mut g) = state.lock() {
+                        *g = SemanticState::Failed(format!(
+                            "语义模型加载失败，已降级关键词检索：{err}"
+                        ));
+                    }
+                }
+            }
+        });
+    }
+
+    fn semantic_state(&self) -> SemanticState {
+        self.semantic
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(SemanticState::Idle)
+    }
+
+    fn semantic_ready_embedder(&self) -> Option<Arc<Embedder>> {
+        match self.semantic_state() {
+            SemanticState::Ready(e) => Some(e),
+            _ => None,
+        }
+    }
+
     fn do_search(&mut self) {
         let q = self.query.trim().to_string();
         if q.is_empty() {
@@ -141,7 +197,8 @@ impl App {
             self.status = "还没有打开库。请先点「试用样例」。".into();
             return;
         };
-        match s.search(&q) {
+        let embedder = self.semantic_ready_embedder();
+        match s.search_with(&q, embedder.as_deref()) {
             Ok(r) => {
                 let terms: String = r
                     .terms
@@ -150,7 +207,12 @@ impl App {
                     .map(|t| t.trim_matches('"'))
                     .collect::<Vec<_>>()
                     .join(" / ");
-                self.status = format!("{} ms · 抽词 {} · 命中 {}", r.latency_ms, terms, r.hits.len());
+                let mut st = format!("{} ms · 抽词 {} · 命中 {}", r.latency_ms, terms, r.hits.len());
+                if embedder.is_some() && !r.used_semantic {
+                    // §7.3：语义未参与（模型未就绪/库内无向量）时明示「仅关键词」
+                    st.push_str(" · 仅关键词");
+                }
+                self.status = st;
                 self.selected = r.hits.first().map(|h| h.chunk.id);
                 self.expanded.clear();
                 self.reading_id = None;
@@ -287,6 +349,7 @@ impl App {
         ));
         let (tx, rx) = mpsc::channel();
         let progress_thread = progress.clone();
+        let embedder = self.semantic_ready_embedder();
         thread::spawn(move || {
             let mut store = store;
             let splitter = llm_cfg.map(|c| LlmSplitter::with_progress(c, progress_thread.clone()));
@@ -300,10 +363,24 @@ impl App {
             let opts = ImportOpts {
                 splitter: splitter.as_ref().map(|x| x as &dyn table_canon_core::EntrySplitter),
                 reprocess: splitter.is_some(),
+                embedder: embedder.as_deref(),
             };
             let result = store
                 .import_with(&paths, opts)
                 .map_err(|e| e.to_string());
+            // 语义就绪时补算缺向量（覆盖本次未带向量导入的旧数据，§7.2）
+            if result.is_ok() {
+                if let Some(e) = embedder.as_deref() {
+                    if let Ok(mut g) = progress_thread.lock() {
+                        *g = "检查/补算语义向量…".into();
+                    }
+                    if let Err(err) = store.backfill_embeddings(e, Some(&progress_thread)) {
+                        if let Ok(mut g) = progress_thread.lock() {
+                            *g = format!("语义向量补算失败：{err}");
+                        }
+                    }
+                }
+            }
             let _ = tx.send(ImportOutcome { store, result });
         });
         self.status = progress.lock().map(|g| g.clone()).unwrap_or_else(|_| "后台导入中…".into());
@@ -675,6 +752,34 @@ impl eframe::App for App {
                     ui.separator();
                     ui.label(RichText::new(&self.toast).color(Color32::from_rgb(140, 210, 150)));
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let sem = self.semantic_state();
+                    let (label, color, hover) = match &sem {
+                        SemanticState::Loading => (
+                            "语义 · 准备中",
+                            Color32::from_rgb(210, 190, 100),
+                            "首次加载模型约数秒，期间检索仅用关键词".to_string(),
+                        ),
+                        SemanticState::Ready(_) => (
+                            "语义 · 开",
+                            Color32::from_rgb(140, 210, 150),
+                            "语义检索已开启；导入时自动计算向量，结果卡片会标「语义」".to_string(),
+                        ),
+                        SemanticState::Failed(e) => (
+                            "语义 · 不可用",
+                            Color32::from_rgb(210, 130, 120),
+                            e.clone(),
+                        ),
+                        SemanticState::Idle => (
+                            "语义 · 未装模型",
+                            Color32::from_rgb(150, 150, 145),
+                            "把模型放到 models\\bge-small-zh-v1.5\\（model.onnx + tokenizer.json）后重启即可开启语义检索"
+                                .to_string(),
+                        ),
+                    };
+                    ui.label(RichText::new(label).small().color(color))
+                        .on_hover_text(hover);
+                });
             });
         });
 
@@ -764,6 +869,12 @@ impl eframe::App for App {
                                     Color32::from_rgb(140, 140, 140)
                                 },
                             ));
+                            // §6.6：语义命中无词重叠时不高亮生造词，只在卡片角标标「语义」
+                            if h.via.iter().any(|v| v == "semantic") && !is_entry {
+                                ui.label(
+                                    RichText::new("语义").color(Color32::from_rgb(120, 175, 250)),
+                                );
+                            }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.label(RichText::new("点击查看原文").weak().small());
                             });
