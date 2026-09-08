@@ -59,6 +59,18 @@ struct ImportJob {
 struct ImportOutcome {
     store: Store,
     result: Result<table_canon_core::ImportReport, String>,
+    /// 导入后补算的摘要（条数 / 警告），非空则并进状态栏，不再静默丢弃。
+    backfill: Option<String>,
+}
+
+struct BackfillJob {
+    progress: Arc<Mutex<String>>,
+    rx: mpsc::Receiver<BackfillOutcome>,
+}
+
+struct BackfillOutcome {
+    store: Store,
+    result: Result<(usize, Vec<String>), String>,
 }
 
 struct App {
@@ -76,8 +88,11 @@ struct App {
     expanded: HashSet<i64>,
     llm_enabled: bool,
     import_job: Option<ImportJob>,
+    backfill_job: Option<BackfillJob>,
     reading_id: Option<i64>,
     semantic: Arc<Mutex<SemanticState>>,
+    /// 预热完成只触发一次自动补算，避免每帧重复起线程。
+    semantic_ready_seen: bool,
 }
 
 impl App {
@@ -101,8 +116,10 @@ impl App {
             expanded: HashSet::new(),
             llm_enabled: load_app_config().llm.enabled,
             import_job: None,
+            backfill_job: None,
             reading_id: None,
             semantic: Arc::new(Mutex::new(SemanticState::Loading)),
+            semantic_ready_seen: false,
         };
         app.start_semantic_prewarm();
         if let Some(p) = load_last_store_path() {
@@ -128,6 +145,8 @@ impl App {
         self.selected = None;
         self.reading_id = None;
         self.refresh_info();
+        // 打开的可能是别的模型算过的库，或压根没向量：模型已就绪就补算
+        self.start_backfill();
     }
 
     fn refresh_info(&mut self) {
@@ -146,26 +165,25 @@ impl App {
     fn start_semantic_prewarm(&mut self) {
         let state = self.semantic.clone();
         thread::spawn(move || {
-            let Some(model_dir) = default_model_dir() else {
-                if let Ok(mut g) = state.lock() {
-                    *g = SemanticState::Idle;
-                }
-                return;
+            // ort 的 load-dynamic 在 DLL 缺失/损坏时是 panic 而不是返回 Err（内部 unwrap）。
+            // 不兜住的话线程直接死掉，底栏会永远停在「准备中」，而 §7.3 要求显示不可用。
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let model_dir = default_model_dir()?;
+                let dll = default_dll_path();
+                Some(Embedder::load(&model_dir, dll.as_deref()))
+            }));
+            let next = match outcome {
+                Ok(None) => SemanticState::Idle,
+                Ok(Some(Ok(e))) => SemanticState::Ready(Arc::new(e)),
+                Ok(Some(Err(err))) => SemanticState::Failed(format!(
+                    "语义模型加载失败，已降级关键词检索：{err}"
+                )),
+                Err(_) => SemanticState::Failed(
+                    "语义模型加载异常（onnxruntime.dll 缺失或损坏？），已降级关键词检索".into(),
+                ),
             };
-            let dll = default_dll_path();
-            match Embedder::load(&model_dir, dll.as_deref()) {
-                Ok(e) => {
-                    if let Ok(mut g) = state.lock() {
-                        *g = SemanticState::Ready(Arc::new(e));
-                    }
-                }
-                Err(err) => {
-                    if let Ok(mut g) = state.lock() {
-                        *g = SemanticState::Failed(format!(
-                            "语义模型加载失败，已降级关键词检索：{err}"
-                        ));
-                    }
-                }
+            if let Ok(mut g) = state.lock() {
+                *g = next;
             }
         });
     }
@@ -184,13 +202,97 @@ impl App {
         }
     }
 
+    /// 模型就绪后给缺向量的条目补算（§7.2）。没库 / 没模型 / 已有任务时不做事。
+    /// 补算期间库被移进后台线程，检索与导入暂时让路（与导入任务同一套取舍）。
+    fn start_backfill(&mut self) {
+        if self.backfill_job.is_some() || self.import_job.is_some() {
+            return;
+        }
+        let Some(embedder) = self.semantic_ready_embedder() else {
+            return;
+        };
+        let Some(store) = self.store.take() else {
+            return;
+        };
+        let progress = Arc::new(Mutex::new("检查/补算语义向量…".to_string()));
+        let (tx, rx) = mpsc::channel();
+        let p = progress.clone();
+        thread::spawn(move || {
+            let result = store
+                .backfill_embeddings(embedder.as_ref(), Some(&p))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BackfillOutcome { store, result });
+        });
+        self.backfill_job = Some(BackfillJob { progress, rx });
+    }
+
+    fn poll_backfill_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.backfill_job else {
+            return;
+        };
+        if let Ok(msg) = job.progress.lock() {
+            if !msg.is_empty() && *msg != self.status {
+                self.status = msg.clone();
+            }
+        }
+        match job.rx.try_recv() {
+            Ok(out) => {
+                self.backfill_job = None;
+                self.store = Some(out.store);
+                // 先刷新基础状态，再压上补算结论（refresh_info 会覆盖 status）
+                self.refresh_info();
+                match out.result {
+                    Ok((n, notes)) => {
+                        let mut s = if n > 0 {
+                            format!("语义向量补算完成：{n} 条")
+                        } else {
+                            String::new()
+                        };
+                        if !notes.is_empty() {
+                            let mut w = notes.join("；");
+                            if w.chars().count() > 200 {
+                                w = w.chars().take(200).collect::<String>() + "…";
+                            }
+                            if !s.is_empty() {
+                                s.push_str(" · ");
+                            }
+                            s.push_str(&w);
+                        }
+                        if !s.is_empty() {
+                            self.status = s;
+                        }
+                    }
+                    Err(e) => self.status = format!("语义向量补算失败：{e}"),
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.backfill_job = None;
+                self.status = "语义向量补算线程意外退出。".into();
+            }
+        }
+    }
+
+    /// 导入 / 补算进行中时库不在手上，统一给出人话提示。
+    fn busy_hint(&self) -> Option<&'static str> {
+        if self.import_job.is_some() {
+            Some("正在后台导入，请等拆条完成后再操作。")
+        } else if self.backfill_job.is_some() {
+            Some("正在补算语义向量，请稍候。")
+        } else {
+            None
+        }
+    }
+
     fn do_search(&mut self) {
         let q = self.query.trim().to_string();
         if q.is_empty() {
             return;
         }
-        if self.import_job.is_some() {
-            self.status = "正在后台导入，请等拆条完成后再检索。".into();
+        if let Some(hint) = self.busy_hint() {
+            self.status = hint.into();
             return;
         }
         let Some(s) = self.store.as_ref() else {
@@ -244,6 +346,10 @@ impl App {
     }
 
     fn load_sample(&mut self) {
+        if let Some(hint) = self.busy_hint() {
+            self.status = hint.into();
+            return;
+        }
         let Some(src) = sample_campaign_dir() else {
             self.status = "找不到 testdata/sample-campaign。请在仓库根目录运行，或用「导入文件夹」。".into();
             return;
@@ -273,7 +379,13 @@ impl App {
                 }
             }
         };
-        match store.import_paths(&[src]) {
+        // 带编码器导入：模型已就绪时新条目直接落向量，不必等补算
+        let embedder = self.semantic_ready_embedder();
+        let opts = ImportOpts {
+            embedder: embedder.as_deref(),
+            ..Default::default()
+        };
+        match store.import_with(&[src], opts) {
             Ok(r) => {
                 if r.files_fail > 0 {
                     self.status = format!("样例导入有失败：{}", r.errors.join("；"));
@@ -295,15 +407,17 @@ impl App {
             }
             Err(e) => self.status = format!("导入样例失败: {e}"),
         }
+        // 样例库可能是早先没有模型时建的（条目已存在 → 导入是 Skip，不会补向量）
+        self.start_backfill();
     }
 
     fn import_selected(&mut self, paths: Vec<PathBuf>) {
-        let Some(_s) = self.store.as_ref() else {
-            self.status = "请先新建或打开库，再导入。".into();
+        if let Some(hint) = self.busy_hint() {
+            self.status = hint.into();
             return;
-        };
-        if self.import_job.is_some() {
-            self.status = "已有导入在后台进行，请等它结束。".into();
+        }
+        if self.store.is_none() {
+            self.status = "请先新建或打开库，再导入。".into();
             return;
         }
         let cfg = load_app_config();
@@ -368,20 +482,41 @@ impl App {
             let result = store
                 .import_with(&paths, opts)
                 .map_err(|e| e.to_string());
-            // 语义就绪时补算缺向量（覆盖本次未带向量导入的旧数据，§7.2）
+            // 语义就绪时补算缺向量（覆盖本次未带向量导入的旧数据，§7.2）。
+            // 结论必须带回主线程并入状态栏：这里返回的 (条数, 警告) 曾被直接丢弃，
+            // 条目编码失败时用户只会看到「导入完成」和「语义 · 开」。
+            let mut backfill = None;
             if result.is_ok() {
                 if let Some(e) = embedder.as_deref() {
                     if let Ok(mut g) = progress_thread.lock() {
                         *g = "检查/补算语义向量…".into();
                     }
-                    if let Err(err) = store.backfill_embeddings(e, Some(&progress_thread)) {
-                        if let Ok(mut g) = progress_thread.lock() {
-                            *g = format!("语义向量补算失败：{err}");
+                    match store.backfill_embeddings(e, Some(&progress_thread)) {
+                        Ok((n, notes)) => {
+                            if n > 0 || !notes.is_empty() {
+                                let mut s = if n > 0 {
+                                    format!("语义向量补算 {n} 条")
+                                } else {
+                                    String::new()
+                                };
+                                if !notes.is_empty() {
+                                    if !s.is_empty() {
+                                        s.push('·');
+                                    }
+                                    s.push_str(&notes.join("；"));
+                                }
+                                backfill = Some(s);
+                            }
                         }
+                        Err(err) => backfill = Some(format!("语义向量补算失败：{err}")),
                     }
                 }
             }
-            let _ = tx.send(ImportOutcome { store, result });
+            let _ = tx.send(ImportOutcome {
+                store,
+                result,
+                backfill,
+            });
         });
         self.status = progress.lock().map(|g| g.clone()).unwrap_or_else(|_| "后台导入中…".into());
         self.import_job = Some(ImportJob { progress, rx });
@@ -402,7 +537,7 @@ impl App {
                 self.import_job = None;
                 remember_store(&out.store.path);
                 self.store = Some(out.store);
-                let import_msg = match out.result {
+                let mut import_msg = match out.result {
                     Ok(r) => {
                         let mut s = format!(
                             "导入完成：成功 {} / 跳过 {} / 失败 {} / 条目 {} / 未挂修正 {}",
@@ -428,6 +563,10 @@ impl App {
                     }
                     Err(e) => format!("导入失败: {e}"),
                 };
+                if let Some(b) = &out.backfill {
+                    import_msg.push_str(" · ");
+                    import_msg.push_str(b);
+                }
                 self.refresh_info();
                 self.status = import_msg;
             }
@@ -606,6 +745,13 @@ impl eframe::App for App {
             }
         }
         self.poll_import_job(ctx);
+        self.poll_backfill_job(ctx);
+        // 预热完成（Loading → Ready）后自动补算库内缺的向量（§7.2）。
+        // 没有这一步，启动时打开的旧库永远是纯关键词，底栏却写着「语义 · 开」。
+        if !self.semantic_ready_seen && matches!(self.semantic_state(), SemanticState::Ready(_)) {
+            self.semantic_ready_seen = true;
+            self.start_backfill();
+        }
 
         let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));

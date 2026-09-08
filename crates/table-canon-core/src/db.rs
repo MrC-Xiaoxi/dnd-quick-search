@@ -279,6 +279,36 @@ impl Store {
             .unwrap_or_else(|| file_name.clone());
         let (mut drafts, mut notes) = refine_drafts(&blocks, &stem, opts.splitter);
 
+        // §7.2 语义向量导入期计算：编码是 CPU 推理（慢），必须在写事务外做完再开事务，
+        // 否则整段推理都占着 SQLite 写锁（WAL 无法 checkpoint，别的连接 SQLITE_BUSY）。
+        // 只依赖正文，不受下面修正逻辑影响；单条失败只影响该条向量，不阻断导入。
+        let mut vec_rows: Vec<(usize, i64, String, Vec<u8>)> = Vec::new();
+        if let Some(e) = opts.embedder {
+            let mut first_err: Option<String> = None;
+            'enc: for (di, d) in drafts.iter().enumerate() {
+                for (seq, sub) in crate::embed::split_subblocks(&d.body).into_iter().enumerate() {
+                    match e.encode_doc(&sub) {
+                        Ok(v) => vec_rows.push((
+                            di,
+                            seq as i64,
+                            sub.clone(),
+                            crate::embed::vec_to_blob(&v),
+                        )),
+                        Err(err) => {
+                            first_err.get_or_insert_with(|| {
+                                format!("「{}」语义向量计算失败，该条暂无向量：{err}", d.title)
+                            });
+                            vec_rows.retain(|r| r.0 != di);
+                            continue 'enc;
+                        }
+                    }
+                }
+            }
+            if let Some(msg) = first_err {
+                notes.push(msg);
+            }
+        }
+
         let tx = self.conn.unchecked_transaction()?;
 
         let doc_id = if let Some((id, _)) = existing {
@@ -351,30 +381,6 @@ impl Store {
         let unmatched = used.iter().filter(|u| !**u).count();
 
         tx.execute("DELETE FROM chunks WHERE source_document_id=?1", [doc_id])?;
-
-        // 语义向量导入期计算（§7.2）：编码在事务外做（慢），写库在事务内（快）。
-        // 单条失败只影响该条向量，不阻断导入。
-        let mut vec_rows: Vec<(usize, i64, String, Vec<u8>)> = Vec::new();
-        if let Some(e) = opts.embedder {
-            let mut first_err: Option<String> = None;
-            'enc: for (di, d) in drafts.iter().enumerate() {
-                for (seq, sub) in crate::embed::split_subblocks(&d.body).into_iter().enumerate() {
-                    match e.encode_doc(&sub) {
-                        Ok(v) => vec_rows.push((di, seq as i64, sub.clone(), crate::embed::vec_to_blob(&v))),
-                        Err(err) => {
-                            first_err.get_or_insert_with(|| {
-                                format!("「{}」语义向量计算失败，该条暂无向量：{err}", d.title)
-                            });
-                            vec_rows.retain(|r| r.0 != di);
-                            continue 'enc;
-                        }
-                    }
-                }
-            }
-            if let Some(msg) = first_err {
-                notes.push(msg);
-            }
-        }
 
         let now = now_rfc3339();
         let n = drafts.len();
@@ -454,44 +460,41 @@ impl Store {
         progress: Option<&std::sync::Mutex<String>>,
     ) -> Result<(usize, Vec<String>)> {
         let mut notes = Vec::new();
-        let tx = self.conn.unchecked_transaction()?;
-        if ensure_embedding_meta(&tx, Some(e))? {
+        // 第一段事务只做元数据校验与「缺向量」清点（快），随即提交；
+        // 编码（慢，CPU 推理）放在事务外，避免长时间占着写锁。
+        let (rows, switched) = {
+            let tx = self.conn.unchecked_transaction()?;
+            let switched = ensure_embedding_meta(&tx, Some(e))?;
+            let rows: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT c.id, c.body FROM chunks c
+                     WHERE c.campaign_id=?1
+                       AND NOT EXISTS (SELECT 1 FROM embedding_chunks ec WHERE ec.chunk_id=c.id)",
+                )?;
+                let it =
+                    stmt.query_map(params![self.campaign_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                it.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            tx.commit()?;
+            (rows, switched)
+        };
+        if switched {
             notes.push("语义模型已切换，旧向量已清空并全量重算".into());
         }
-        let rows: Vec<(i64, String)> = {
-            let mut stmt = tx.prepare(
-                "SELECT c.id, c.body FROM chunks c
-                 WHERE c.campaign_id=?1
-                   AND NOT EXISTS (SELECT 1 FROM embedding_chunks ec WHERE ec.chunk_id=c.id)",
-            )?;
-            let it = stmt.query_map(params![self.campaign_id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?;
-            it.collect::<rusqlite::Result<Vec<_>>>()?
-        };
         let total = rows.len();
+        // 编码全部做完再开第二个事务写入；单条失败丢它自己的半截结果
+        let mut buf: Vec<(i64, i64, String, Vec<u8>)> = Vec::new();
         for (k, (cid, body)) in rows.into_iter().enumerate() {
-            let mut buf: Vec<(i64, String, Vec<u8>)> = Vec::new();
-            let mut failed = false;
+            let before = buf.len();
             for (seq, sub) in crate::embed::split_subblocks(&body).into_iter().enumerate() {
                 match e.encode_doc(&sub) {
-                    Ok(v) => buf.push((seq as i64, sub, crate::embed::vec_to_blob(&v))),
+                    Ok(v) => buf.push((cid, seq as i64, sub, crate::embed::vec_to_blob(&v))),
                     Err(err) => {
                         notes.push(format!("条目 {cid} 向量计算失败，已跳过：{err}"));
-                        failed = true;
+                        buf.truncate(before); // 半截向量不写库
                         break;
                     }
                 }
-            }
-            if failed {
-                continue;
-            }
-            for (seq, sub, blob) in buf {
-                tx.execute(
-                    "INSERT INTO embedding_chunks(campaign_id, chunk_id, seq, body, embedding)
-                     VALUES(?1,?2,?3,?4,?5)",
-                    params![self.campaign_id, cid, seq, sub, blob],
-                )?;
             }
             if let Some(p) = progress {
                 if let Ok(mut g) = p.lock() {
@@ -499,7 +502,17 @@ impl Store {
                 }
             }
         }
-        tx.commit()?;
+        if !buf.is_empty() {
+            let tx = self.conn.unchecked_transaction()?;
+            for (cid, seq, sub, blob) in buf {
+                tx.execute(
+                    "INSERT INTO embedding_chunks(campaign_id, chunk_id, seq, body, embedding)
+                     VALUES(?1,?2,?3,?4,?5)",
+                    params![self.campaign_id, cid, seq, sub, blob],
+                )?;
+            }
+            tx.commit()?;
+        }
         Ok((total, notes))
     }
 
@@ -635,39 +648,50 @@ fn ensure_embedding_meta(
     let Some(e) = e else {
         return Ok(false);
     };
-    let existing: Option<String> = conn
-        .query_row("SELECT model_id FROM embedding_meta WHERE id=1", [], |r| {
-            r.get(0)
-        })
+    // model_version 存 model.onnx 的内容指纹：model_id 是编译期常量，
+    // 同名换文件时它不变，只有指纹能发现「库里的向量不是这个模型算的」。
+    let existing: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT model_id, model_version, pooling, query_prefix FROM embedding_meta WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
         .optional()?;
+    let matches = |m: &(String, String, String, String)| {
+        m.0 == e.model_id()
+            && m.1 == e.fingerprint()
+            && m.2 == "cls"
+            && m.3 == crate::embed::QUERY_PREFIX
+    };
     match existing {
+        Some(m) if matches(&m) => Ok(false),
+        Some(_) => {
+            conn.execute("DELETE FROM embedding_chunks", [])?;
+            conn.execute(
+                "UPDATE embedding_meta SET model_id=?1, model_version=?2, dim=?3, quant=?4, runtime='onnx', pooling='cls', query_prefix=?5 WHERE id=1",
+                params![
+                    e.model_id(),
+                    e.fingerprint(),
+                    crate::embed::EMBED_DIM as i64,
+                    crate::embed::META_QUANT,
+                    crate::embed::QUERY_PREFIX
+                ],
+            )?;
+            Ok(true)
+        }
         None => {
             conn.execute(
                 "INSERT INTO embedding_meta(id, model_id, model_version, dim, quant, runtime, pooling, query_prefix)
-                 VALUES(1,?1,'1',?2,?3,'onnx','cls',?4)",
+                 VALUES(1,?1,?2,?3,?4,'onnx','cls',?5)",
                 params![
                     e.model_id(),
+                    e.fingerprint(),
                     crate::embed::EMBED_DIM as i64,
                     crate::embed::META_QUANT,
                     crate::embed::QUERY_PREFIX
                 ],
             )?;
             Ok(false)
-        }
-        Some(id) if id == e.model_id() => Ok(false),
-        Some(old) => {
-            conn.execute("DELETE FROM embedding_chunks", [])?;
-            conn.execute(
-                "UPDATE embedding_meta SET model_id=?1, model_version='1', dim=?2, quant=?3, runtime='onnx', pooling='cls', query_prefix=?4 WHERE id=1",
-                params![
-                    e.model_id(),
-                    crate::embed::EMBED_DIM as i64,
-                    crate::embed::META_QUANT,
-                    crate::embed::QUERY_PREFIX
-                ],
-            )?;
-            let _ = old;
-            Ok(true)
         }
     }
 }

@@ -191,14 +191,24 @@ fn semantic_chunk_ranks(
     e: &crate::embed::Embedder,
     query: &str,
 ) -> Result<Vec<i64>> {
-    // embedding_meta 强校验：换过模型的库必须重算后才可信
-    let meta: Option<String> = conn
-        .query_row("SELECT model_id FROM embedding_meta WHERE id=1", [], |r| {
-            r.get(0)
-        })
+    // embedding_meta 强校验（§7.5）：模型标识、模型文件指纹、池化口径、查询前缀
+    // 任一不符即认为库内向量不可信，降级纯词法。指纹这一项是必需的——model_id 是
+    // 编译期常量，只比它的话「换掉 model.onnx 再重启」根本发现不了。
+    let meta: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT model_id, model_version, pooling, query_prefix FROM embedding_meta WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
         .optional()?;
-    if meta.as_deref() != Some(e.model_id()) {
-        anyhow::bail!("语义模型与库内向量不一致");
+    let consistent = meta.as_ref().is_some_and(|m| {
+        m.0 == e.model_id()
+            && m.1 == e.fingerprint()
+            && m.2 == "cls"
+            && m.3 == crate::embed::QUERY_PREFIX
+    });
+    if !consistent {
+        anyhow::bail!("语义模型与库内向量不一致（换过模型文件或口径），需重新导入/补算");
     }
     let t0 = Instant::now();
     let qv = e.encode_query(query)?;
@@ -213,16 +223,21 @@ fn semantic_chunk_ranks(
     })?;
     // §6.5：同一 chunk 只取最好子块分，禁止靠块数刷分
     let mut best: HashMap<i64, f32> = HashMap::new();
+    let mut scanned: u32 = 0;
     for r in rows {
         let (cid, blob) = r?;
-        let v = crate::embed::blob_to_vec(&blob);
-        if v.len() != crate::embed::EMBED_DIM {
+        // 直接从 BLOB 求点积：每行一次 blob_to_vec 分配是这条热路径的主要开销
+        let Some(s) = crate::embed::dot_blob(&qv, &blob) else {
             continue;
-        }
-        let s = crate::embed::dot(&qv, &v);
+        };
         let slot = best.entry(cid).or_insert(f32::NEG_INFINITY);
         if s > *slot {
             *slot = s;
+        }
+        // §8 预算：扫太久就停手，宁可少召回几条也不把 egui 主线程冻住
+        scanned += 1;
+        if scanned.is_multiple_of(512) && t0.elapsed().as_millis() > SEMANTIC_BUDGET_MS {
+            break;
         }
     }
     let mut pairs: Vec<(i64, f32)> = best.into_iter().collect();

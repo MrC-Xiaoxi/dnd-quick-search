@@ -3,7 +3,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 pub const MODEL_ID: &str = "bge-small-zh-v1.5";
 pub const EMBED_DIM: usize = 512;
@@ -19,6 +19,9 @@ pub struct Embedder {
     session: Mutex<ort::session::Session>,
     #[allow(dead_code)]
     tokenizer: tokenizers::Tokenizer,
+    /// model.onnx 内容的 sha256。`MODEL_ID` 是编译期常量，换模型文件（哪怕同名同版本）
+    /// 也变不了，只比它等于没比；指纹写进 embedding_meta 才是真校验（§7.5）。
+    fingerprint: String,
 }
 
 impl Embedder {
@@ -34,6 +37,12 @@ impl Embedder {
             );
         }
         init_ort_dll(dll_path)?;
+
+        // 内容指纹：换过模型文件但沿用同一 MODEL_ID 时，靠它发现「库里的向量不是这个模型算的」
+        let fingerprint = crate::normalize::sha256_file_hex(
+            &std::fs::read(&model)
+                .with_context(|| format!("读取模型失败: {}", model.display()))?,
+        );
 
         let mut tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
             .map_err(|e| anyhow::anyhow!("加载 tokenizer 失败: {e}"))?;
@@ -53,11 +62,17 @@ impl Embedder {
         Ok(Self {
             session: Mutex::new(session),
             tokenizer,
+            fingerprint,
         })
     }
 
     pub fn model_id(&self) -> &'static str {
         MODEL_ID
+    }
+
+    /// 模型内容指纹（model.onnx 的 sha256），供 embedding_meta 强校验比对。
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 
     /// 文档侧编码：无前缀（§7.1）。
@@ -67,7 +82,12 @@ impl Embedder {
 
     /// 查询侧编码：带 BGE 检索前缀（§7.1）。
     pub fn encode_query(&self, text: &str) -> Result<Vec<f32>> {
-        self.encode(&format!("{QUERY_PREFIX}{}", text.trim()))
+        let text = text.trim();
+        // 空查询必须在这里拦：拼上前缀后整体非空，encode 的空文本守卫就失效了
+        if text.is_empty() {
+            bail!("空查询不编码");
+        }
+        self.encode(&format!("{QUERY_PREFIX}{text}"))
     }
 
     fn encode(&self, text: &str) -> Result<Vec<f32>> {
@@ -97,6 +117,7 @@ impl Embedder {
             .session
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        let out_names: Vec<String> = session.outputs.iter().map(|o| o.name.clone()).collect();
         let has_tti = session.inputs.iter().any(|i| i.name == "token_type_ids");
         let outputs = if has_tti {
             let tti = vec![0i64; n];
@@ -111,28 +132,41 @@ impl Embedder {
                 "attention_mask" => ort::value::Tensor::from_array(([1usize, n], mask_i64))?,
             ])?
         };
-        let (shape, data) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
-        if data.len() < EMBED_DIM {
-            bail!("模型输出过小: shape={shape:?} len={}", data.len());
+        // 用 get 而不是 outputs["..."]：后者在输出名不符时直接 panic，
+        // 会把「模型不兼容」变成进程崩溃，绕过 §7.3 的优雅降级
+        let out = outputs.get("last_hidden_state").ok_or_else(|| {
+            anyhow::anyhow!("模型没有 last_hidden_state 输出（实际输出：{out_names:?}）")
+        })?;
+        let (shape, data) = out.try_extract_tensor::<f32>()?;
+        // 布局 (1, seq, dim) 行主序：长度须被 token 数整除，且隐层维度须等于 512。
+        // 只查 len < 512 会放过 768/1024 维模型——那会静默截前 512 维当向量用。
+        if n == 0 || data.len() % n != 0 {
+            bail!(
+                "模型输出长度 {} 与 token 数 {n} 不整除（输出不是 (1,seq,dim) 布局？）: shape={shape:?}",
+                data.len()
+            );
         }
-        // CLS pooling：第一个 token 的隐状态（§7.1，不是 mean pooling）；布局 (1, seq, dim) 行主序
+        let dim = data.len() / n;
+        if dim != EMBED_DIM {
+            bail!("模型隐层维度 {dim} ≠ {EMBED_DIM}（models/ 下换成了别的模型？）: shape={shape:?}");
+        }
+        // CLS pooling：第一个 token 的隐状态（§7.1，不是 mean pooling）
         let mut v: Vec<f32> = data[..EMBED_DIM].to_vec();
         l2_normalize(&mut v);
         Ok(v)
     }
 }
 
-/// load-dynamic 模式下 onnxruntime.dll 的定位只需设置一次；进程内只初始化一次。
+/// load-dynamic 模式下 onnxruntime.dll 的定位只需设置一次。
+/// 用互斥量而不是 OnceLock 的 check-then-act：两个线程同时首次加载时，
+/// 后者可能在前者 set_var 之前就判定「已初始化」而跳过（且 set_var 本身非线程安全）。
 fn init_ort_dll(dll_path: Option<&Path>) -> Result<()> {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    if ONCE.get().is_some() {
-        return Ok(());
-    }
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     if std::env::var_os("ORT_DYLIB_PATH")
         .map(|v| !v.is_empty())
         .unwrap_or(false)
     {
-        ONCE.set(()).ok();
         return Ok(());
     }
     let resolved = dll_path.map(Path::to_string_lossy).map(|p| p.to_string());
@@ -142,7 +176,6 @@ fn init_ort_dll(dll_path: Option<&Path>) -> Result<()> {
         }
         std::env::set_var("ORT_DYLIB_PATH", &p);
     }
-    ONCE.set(()).ok();
     Ok(())
 }
 
@@ -169,11 +202,31 @@ pub fn default_dll_path() -> Option<PathBuf> {
 }
 
 fn candidate_roots() -> Vec<PathBuf> {
+    candidate_roots_from(
+        std::env::current_exe().ok().as_deref(),
+        std::env::current_dir().ok(),
+    )
+}
+
+/// 拆出来便于测试。exe 在 target/ 下即开发态，此时向上找仓库根（模型在仓库的 models/）。
+fn candidate_roots_from(exe: Option<&Path>, cwd: Option<PathBuf>) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
+    if let Some(exe) = exe {
         if let Some(parent) = exe.parent() {
             out.push(parent.to_path_buf());
+            // 开发态：cargo run 的 exe 在 target/<profile>/ 下，而模型在仓库根的 models/。
+            // 只在路径里出现过 target 时向上找，安装包布局不受影响。
+            if parent
+                .ancestors()
+                .any(|a| a.file_name().is_some_and(|n| n == "target"))
+            {
+                out.extend(parent.ancestors().skip(1).take(3).map(Path::to_path_buf));
+            }
         }
+    }
+    // 从仓库根直接运行（run-demo.bat 的 CWD 即仓库根）
+    if let Some(cwd) = cwd {
+        out.push(cwd);
     }
     if let Some(loc) = std::env::var_os("LOCALAPPDATA") {
         out.push(PathBuf::from(loc).join("table-canon"));
@@ -242,6 +295,20 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
+/// 直接对 BLOB 求点积，省掉每行一次 `blob_to_vec` 分配（检索热路径）。
+/// 字节数与查询维度不符时返回 None（调用方跳过该行）。
+pub fn dot_blob(q: &[f32], blob: &[u8]) -> Option<f32> {
+    if blob.len() != q.len() * 4 {
+        return None;
+    }
+    Some(
+        q.iter()
+            .zip(blob.chunks_exact(4))
+            .map(|(x, c)| x * f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .sum(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,12 +329,18 @@ mod tests {
         assert!(v.len() >= 4, "应切成多块，实际 {} 块", v.len());
         // 每块不超窗口上限（trim 后可能略短）
         assert!(v.iter().all(|s| s.chars().count() <= SUBBLOCK_CHARS));
-        // 相邻块有重叠：第二块开头应出现在第一块结尾附近
-        let first_end: String = v[0].chars().rev().take(30).collect();
-        let first_end: String = first_end.chars().rev().collect();
+        // 相邻块有重叠：前一块的末尾若干字符必须出现在下一块里。
+        // 注意按「字符」切：中文的字节下标落在字符中间，get(0..8) 会返回 None，
+        // 再 unwrap_or("") 就退化成 contains("") 恒真——这个断言曾因此形同虚设。
+        let tail: String = {
+            let cs: Vec<char> = v[0].chars().collect();
+            cs[cs.len().saturating_sub(8)..].iter().collect()
+        };
+        let tail = tail.trim();
+        assert!(!tail.is_empty(), "块尾取样为空，断言无意义");
         assert!(
-            v[1].contains(first_end.trim_start_matches(|c: char| "。！？；".contains(c)).get(0..8).unwrap_or("")),
-            "相邻块应共享重叠区"
+            v[1].contains(tail),
+            "相邻块应共享重叠区：v[0] 末尾 {tail:?} 未出现在 v[1] 中"
         );
     }
 
@@ -281,6 +354,25 @@ mod tests {
         assert_eq!(blob.len(), 8);
         let back = blob_to_vec(&blob);
         assert_eq!(back, v);
+    }
+
+    #[test]
+    fn dev_build_roots_walk_up_from_target() {
+        // 开发态：cargo run 的 exe 在 target/release 下，模型在仓库根 models/
+        let exe = PathBuf::from("C:/work/repo/target/release/app.exe");
+        let roots = candidate_roots_from(Some(&exe), None);
+        assert!(
+            roots.iter().any(|r| r == &PathBuf::from("C:/work/repo")),
+            "应上溯到仓库根，实际 {roots:?}"
+        );
+        // 安装包布局：exe 就在模型旁边，不应上溯出无关目录
+        let installed = PathBuf::from("C:/Program Files/table-canon/app.exe");
+        let roots2 = candidate_roots_from(Some(&installed), None);
+        assert_eq!(
+            roots2.first(),
+            Some(&PathBuf::from("C:/Program Files/table-canon"))
+        );
+        assert!(roots2.len() <= 2, "不应上溯出无关目录: {roots2:?}");
     }
 
     #[test]

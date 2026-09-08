@@ -104,6 +104,48 @@ fn backfill_after_import_without_model_restores_semantic() -> Result<()> {
     Ok(())
 }
 
+/// 模型指纹门禁（§7.5）：库里向量的指纹与当前模型文件不符时，语义路必须整条禁用。
+/// 这个断言存在的意义：`model_id` 是编译期常量，只比它的话「换个 model.onnx 重启」
+/// 永远发现不了，旧向量会被当成新模型的结果继续参与排序。
+#[test]
+fn model_fingerprint_mismatch_disables_semantic() -> Result<()> {
+    let Some((model_dir, dll)) = model_paths() else {
+        eprintln!("跳过：models/ 下没有模型或 onnxruntime.dll（bash scripts/fetch-model.sh 可下载）");
+        return Ok(());
+    };
+    let embedder = Arc::new(Embedder::load(&model_dir, Some(&dll))?);
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("stale.tcs");
+    let mut store = Store::create(&path, "指纹测试")?;
+    let sample = repo_root().join("testdata/sample-campaign");
+    store.import_with(
+        &[sample],
+        ImportOpts {
+            embedder: Some(embedder.as_ref()),
+            ..Default::default()
+        },
+    )?;
+    assert!(store.info()?.semantic_ready);
+
+    // 模拟「用户换掉了 models/ 下的 model.onnx」：指纹随之改变
+    {
+        let conn = rusqlite::Connection::open(&path)?;
+        conn.execute(
+            "UPDATE embedding_meta SET model_version='0000deadbeef0000' WHERE id=1",
+            [],
+        )?;
+    }
+
+    let r = store.search_with(
+        "想找个地方小酌一杯，听说有家酒馆招牌挺特别",
+        Some(embedder.as_ref()),
+    )?;
+    assert!(!r.used_semantic, "指纹不符时必须降级词法，不能拿旧向量当新模型的结果");
+    assert!(!r.hits.is_empty(), "降级后词法路仍应出结果");
+    Ok(())
+}
+
 #[test]
 fn degradation_without_embedder_keeps_lexical() -> Result<()> {
     let dir = tempfile::tempdir()?;
