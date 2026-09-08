@@ -158,7 +158,7 @@ impl Store {
         let dst = Connection::open(target)?;
         dst.pragma_update(None, "journal_mode", "DELETE")?;
         let mode: String = dst.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
-        if mode.to_ascii_lowercase() != "delete" {
+        if !mode.eq_ignore_ascii_case("delete") {
             bail!("快照 journal_mode 不是 delete，实际={mode}");
         }
         drop(dst);

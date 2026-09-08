@@ -1,4 +1,4 @@
-﻿﻿﻿# 席间索 Windows 发布打包脚本
+﻿# 席间索 Windows 发布打包脚本
 # 用法: powershell -NoProfile -ExecutionPolicy Bypass -File packaging\package-release.ps1
 # 产物: dist\席间索-v<版本>-win64.zip（解压即用；内含安装/卸载脚本）
 # 说明:

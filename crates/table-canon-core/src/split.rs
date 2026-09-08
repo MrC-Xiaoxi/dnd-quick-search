@@ -497,7 +497,7 @@ fn strip_heading_marks(t: &str) -> String {
 fn is_entry_heading(t: &str) -> bool {
     let t = t.trim();
     let n = t.chars().count();
-    if n < 2 || n > 16 {
+    if !(2..=16).contains(&n) {
         return false;
     }
     if looks_like_chapter_title(t) {
@@ -642,7 +642,7 @@ fn fuzzy_find_cut(source: &str, segs: &[Segment], p: &ExtractedEntry, from: usiz
             continue;
         }
         let sim = bigram_dice(needle, seg.text(source));
-        if sim >= 0.7 && best.map_or(true, |(s, _)| sim > s) {
+        if sim >= 0.7 && best.is_none_or(|(s, _)| sim > s) {
             best = Some((sim, seg.offset));
         }
     }

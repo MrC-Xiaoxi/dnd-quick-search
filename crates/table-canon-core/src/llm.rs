@@ -177,7 +177,7 @@ impl LlmSplitter {
     /// 成功才返回原文用于写缓存，失败结果绝不落缓存。
     fn split_piece_retry(&self, title: &str, piece: &str) -> Result<(String, Vec<ExtractedEntry>)> {
         let base = format!("章节标题：{title}\n正文（每行开头的 [nnn] 是框架标注的段号）：\n{piece}");
-        let attempts = self.cfg.retries.max(0) + 1;
+        let attempts = self.cfg.retries + 1;
         let mut last_err: Option<String> = None;
         for attempt in 0..attempts {
             let mut user = base.clone();

@@ -7,11 +7,9 @@ const CARTESIAN_CAP: usize = 16;
 pub fn char_readings(ch: char) -> Vec<String> {
     let s = ch.to_string();
     let mut set = BTreeSet::new();
-    for multi in s.as_str().to_pinyin_multi() {
-        if let Some(multi) = multi {
-            for p in multi {
-                set.insert(p.plain().to_string());
-            }
+    for multi in s.as_str().to_pinyin_multi().flatten() {
+        for p in multi {
+            set.insert(p.plain().to_string());
         }
     }
     if set.is_empty() {

@@ -19,7 +19,7 @@ fn fixture_chapter() -> String {
         "山口下方的旧驿道通往废弃的哨站，据说埋着前朝的军械。冒险者公会多次悬赏探路，回来的队伍却都说不清哨站里到底有什么。",
     ];
     base.iter()
-        .map(|p| std::iter::repeat(*p).take(3).collect::<String>())
+        .map(|p| std::iter::repeat_n(*p, 3).collect::<String>())
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -48,7 +48,7 @@ fn entry(title: &str, start: i64, end: i64, anchor: &str) -> ExtractedEntry {
 /// 标准好模型：按段号精确提议，条目衔接覆盖全部正文。
 struct GoodModel;
 impl EntrySplitter for GoodModel {
-    fn split_chapter(&self, _t: &str, body: &str) -> Result<Vec<ExtractedEntry>> {
+    fn split_chapter(&self, _t: &str, _body: &str) -> Result<Vec<ExtractedEntry>> {
         Ok(vec![
             entry("铁砧堡", 0, 0, ""),
             entry("荀岚", 1, 1, ""),
@@ -132,7 +132,7 @@ fn segment_numbering_is_stable_between_splitter_and_materializer() {
     let body = fixture_chapter();
     let segs = segment_text(&body);
     assert_eq!(segs.len(), 5, "每段一行，共 5 段");
-    assert_eq!(segs[0].text(&body).starts_with("铁砧堡"), true);
-    assert_eq!(segs[1].text(&body).starts_with("城主荀岚"), true);
-    assert_eq!(segs[4].text(&body).starts_with("山口下方"), true);
+    assert!(segs[0].text(&body).starts_with("铁砧堡"));
+    assert!(segs[1].text(&body).starts_with("城主荀岚"));
+    assert!(segs[4].text(&body).starts_with("山口下方"));
 }

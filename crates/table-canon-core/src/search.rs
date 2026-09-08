@@ -71,7 +71,7 @@ pub fn search(conn: &Connection, campaign_id: i64, q: SearchQuery<'_>) -> Result
     let qn = crate::normalize::normalize(&q0);
     let n_hanzi = hanzi_count(&qn);
     // 不全书 HHK：先扫标题/别名/路径（条目索引）
-    if n_hanzi >= 1 && n_hanzi <= 12 && !timed_out(started) {
+    if (1..=12).contains(&n_hanzi) && !timed_out(started) {
         like_scan(
             conn,
             campaign_id,
@@ -83,7 +83,7 @@ pub fn search(conn: &Connection, campaign_id: i64, q: SearchQuery<'_>) -> Result
         );
     }
     // 不全书 Search 页：正文只作补召回，权重低
-    if n_hanzi >= 1 && n_hanzi <= 4 && !timed_out(started) {
+    if (1..=4).contains(&n_hanzi) && !timed_out(started) {
         like_scan(
             conn,
             campaign_id,

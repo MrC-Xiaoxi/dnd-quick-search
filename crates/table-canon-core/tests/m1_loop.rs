@@ -28,7 +28,7 @@ fn import_search_copy_reimport_snapshot() {
     let store_path = dir.path().join("demo.tcs");
     let mut store = Store::create(&store_path, "断桅港战役").unwrap();
 
-    let report = store.import_paths(&[campaign_copy.clone()]).unwrap();
+    let report = store.import_paths(std::slice::from_ref(&campaign_copy)).unwrap();
     assert!(report.files_ok >= 1, "{report:?}");
     assert!(report.chunks >= 1);
 
@@ -96,7 +96,7 @@ fn import_search_copy_reimport_snapshot() {
         orig.replace("码头上总有湿咸的风。", "码头上总有湿咸的风（错字测试）。"),
     )
     .unwrap();
-    let report2 = store.import_paths(&[campaign_copy.clone()]).unwrap();
+    let report2 = store.import_paths(std::slice::from_ref(&campaign_copy)).unwrap();
     assert!(report2.files_ok + report2.files_skip >= 1);
 
     let r2 = store.search("独眼酒保").unwrap();
@@ -144,12 +144,12 @@ fn hash_rename_does_not_duplicate() {
     copy_dir(&testdata(), &campaign_copy);
     let store_path = dir.path().join("demo.tcs");
     let mut store = Store::create(&store_path, "断桅港战役").unwrap();
-    store.import_paths(&[campaign_copy.clone()]).unwrap();
+    store.import_paths(std::slice::from_ref(&campaign_copy)).unwrap();
     let n = store.info().unwrap().chunk_count;
     let old = campaign_copy.join("02-港口.md");
     let new = campaign_copy.join("港口-renamed.md");
     fs::rename(&old, &new).unwrap();
-    let report = store.import_paths(&[campaign_copy.clone()]).unwrap();
+    let report = store.import_paths(std::slice::from_ref(&campaign_copy)).unwrap();
     assert_eq!(store.info().unwrap().chunk_count, n, "rename by hash duplicated: {report:?}");
     let paths = store.source_paths().unwrap();
     assert!(

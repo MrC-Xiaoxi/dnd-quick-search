@@ -25,15 +25,11 @@ pub fn digest(data: &[u8]) -> [u8; 32] {
     block[n] = 0x80;
     n += 1;
     if n > 56 {
-        for i in n..64 {
-            block[i] = 0;
-        }
+        block[n..64].fill(0);
         compress(&mut state, &block);
         n = 0;
     }
-    for i in n..56 {
-        block[i] = 0;
-    }
+    block[n..56].fill(0);
     let bits = len.saturating_mul(8);
     block[56..64].copy_from_slice(&bits.to_be_bytes());
     compress(&mut state, &block);
