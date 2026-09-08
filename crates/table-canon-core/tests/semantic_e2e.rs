@@ -51,8 +51,8 @@ fn semantic_end_to_end_when_model_present() -> Result<()> {
     eprintln!("语义 top5: {:?}", &titles[..titles.len().min(5)]);
     assert!(r.used_semantic, "应当走了语义路");
     assert!(
-        titles.iter().take(5).any(|t| t.contains("酒馆")),
-        "断桅酒馆应进前 5，实际: {titles:?}"
+        titles.first().is_some_and(|t| t.contains("酒馆")),
+        "断桅酒馆应为语义第 1 名，实际: {titles:?}"
     );
 
     // 降级路径：不带编码器 → 纯词法，照常工作
@@ -60,11 +60,47 @@ fn semantic_end_to_end_when_model_present() -> Result<()> {
     assert!(!r2.used_semantic);
     assert!(!r2.hits.is_empty(), "词法路仍应命中");
 
-    // 同库打开后补算路径：删光向量再 backfill，semantic_ready 恢复
-    store.backfill_embeddings(embedder.as_ref(), None)?;
-    let info2 = store.info()?;
-    assert!(info2.semantic_ready);
+    // 重复补算应无事可做：向量已齐备时幂等，不产生重复行
+    let (n, notes) = store.backfill_embeddings(embedder.as_ref(), None)?;
+    assert_eq!(n, 0, "向量已齐备，补算不应再算任何条目");
+    assert!(notes.is_empty(), "补算不应有告警: {notes:?}");
+    assert!(store.info()?.semantic_ready);
 
+    Ok(())
+}
+
+/// 「同库打开后补算」路径：先无模型导入（只有词法），模型就位后再补算向量。
+#[test]
+fn backfill_after_import_without_model_restores_semantic() -> Result<()> {
+    let Some((model_dir, dll)) = model_paths() else {
+        eprintln!("跳过：models/ 下没有模型或 onnxruntime.dll（bash scripts/fetch-model.sh 可下载）");
+        return Ok(());
+    };
+    let embedder = Arc::new(Embedder::load(&model_dir, Some(&dll))?);
+
+    let dir = tempfile::tempdir()?;
+    let mut store = Store::create(dir.path().join("backfill.tcs"), "补算测试")?;
+
+    let sample = repo_root().join("testdata/sample-campaign");
+    let report = store.import_with(&[sample], ImportOpts::default())?;
+    assert_eq!(report.files_ok, 3);
+    assert!(!store.info()?.semantic_ready, "无编码器导入不应有向量");
+
+    let (n, notes) = store.backfill_embeddings(embedder.as_ref(), None)?;
+    assert!(n > 0, "应补算到条目，实际 {n}");
+    assert!(notes.is_empty(), "补算不应有告警: {notes:?}");
+    assert!(store.info()?.semantic_ready, "补算后 semantic_ready 应恢复");
+
+    let r = store.search_with(
+        "想找个地方小酌一杯，听说有家酒馆招牌挺特别",
+        Some(embedder.as_ref()),
+    )?;
+    assert!(r.used_semantic, "补算后应能走语义路");
+    let titles: Vec<String> = r.hits.iter().map(|h| h.chunk.title.clone()).collect();
+    assert!(
+        titles.first().is_some_and(|t| t.contains("酒馆")),
+        "补算后语义第 1 名应为断桅酒馆，实际: {titles:?}"
+    );
     Ok(())
 }
 

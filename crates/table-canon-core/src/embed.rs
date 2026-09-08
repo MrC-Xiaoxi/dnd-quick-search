@@ -75,9 +75,11 @@ impl Embedder {
         if text.is_empty() {
             bail!("空文本不编码");
         }
+        // add_special_tokens=true：必须补上 [CLS]/[SEP]，否则下面的 CLS pooling
+        // 取到的是首个正文 token 的隐状态（golden 门禁实测余弦 0.82 → 0.99）
         let enc = self
             .tokenizer
-            .encode(text, false)
+            .encode(text, true)
             .map_err(|e| anyhow::anyhow!("分词失败: {e}"))?;
         let ids = enc.get_ids();
         let n = ids.len();
