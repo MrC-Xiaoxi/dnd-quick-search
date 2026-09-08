@@ -4,7 +4,7 @@
 # 说明:
 #   - 构建叠加 crt-static，exe 自带 C 运行时，目标机器无需安装 VC++ Redist
 #   - packaging/*.bat 为 GBK+CRLF、*.txt/*.ps1 为 UTF8-BOM（cmd 与 PowerShell 5.1 解析中文所必需）
-#     转换是幂等的：只把「有效的 UTF-8」源文件转成目标编码，已转换过的自动跳过
+#     转换是幂等的：写回前先剥掉已有的 BOM，否则每跑一次就多一个 EF BB BF
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -16,6 +16,8 @@ function Convert-Text([string]$rel, [bool]$bom) {
     $strict = New-Object Text.UTF8Encoding -ArgumentList $false, $true  # 非法 UTF-8 字节即抛异常
     try {
         $text = $strict.GetString([IO.File]::ReadAllBytes($p)) -replace "(?<!`r)`n", "`r`n"
+        # 已有 BOM 会被解成 U+FEFF，WriteAllText 又会补一个：不剥掉就每次运行累加一层
+        $text = $text.TrimStart([char]0xFEFF)
         [IO.File]::WriteAllText($p, $text, $(if ($bom) { $utf8bom } else { $gbk }))
         Write-Host "  编码转换: $rel"
     } catch {
@@ -56,20 +58,19 @@ try {
     Copy-Item "testdata\sample-campaign" (Join-Path $stage "testdata\sample-campaign") -Recurse -Force
     Copy-Item "README.md" $stage -ErrorAction SilentlyContinue
 
-    # M2 语义检索：模型 + ONNX Runtime 进包（缺失则打包纯词法版并提示）
-    if ((Test-Path "models\bge-small-zh-v1.5\model.onnx") -and (Test-Path "models\bge-small-zh-v1.5\tokenizer.json")) {
+    # M2 语义检索：模型与 ONNX Runtime 必须成对进包（缺任一个都跑不起来）
+    $hasModel = (Test-Path "models\bge-small-zh-v1.5\model.onnx") -and (Test-Path "models\bge-small-zh-v1.5\tokenizer.json")
+    $hasDll = Test-Path "models\onnxruntime\onnxruntime.dll"
+    if ($hasModel -and $hasDll) {
         New-Item -ItemType Directory -Force -Path (Join-Path $stage "models\bge-small-zh-v1.5") | Out-Null
         Copy-Item "models\bge-small-zh-v1.5\model.onnx" (Join-Path $stage "models\bge-small-zh-v1.5\model.onnx")
         Copy-Item "models\bge-small-zh-v1.5\tokenizer.json" (Join-Path $stage "models\bge-small-zh-v1.5\tokenizer.json")
-        Write-Host "  语义模型已入包"
-    } else {
-        Write-Host "  [提示] models\bge-small-zh-v1.5 缺失，本包不含语义检索（bash scripts/fetch-model.sh 可下载）"
-    }
-    if (Test-Path "models\onnxruntime\onnxruntime.dll") {
         Copy-Item "models\onnxruntime\onnxruntime.dll" (Join-Path $stage "onnxruntime.dll")
-        Write-Host "  onnxruntime.dll 已入包"
+        Write-Host "  语义模型 + onnxruntime.dll 已入包"
+    } elseif ($hasModel -or $hasDll) {
+        Write-Host "  [提示] 模型与 onnxruntime.dll 只到齐一个，本包不含语义检索（两者必须同时具备）"
     } else {
-        Write-Host "  [提示] models\onnxruntime\onnxruntime.dll 缺失，语义不可用"
+        Write-Host "  [提示] models\ 缺失，本包不含语义检索（bash scripts/fetch-model.sh 可下载）"
     }
 
     # 4) 压缩

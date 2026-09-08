@@ -32,6 +32,6 @@ del /f /q "%DIR%席间索.exe" "%DIR%llmconfig.example.toml" "%DIR%使用说明.txt" "%
 
 echo.
 echo 卸载完成。如目录中还有剩余文件（例如你自己改过的 llmconfig.toml），可手动删除。
-echo 如需彻底清理缓存，还可删除: %APPDATA%\table-canon
+echo 如需彻底清理，还可删除: %APPDATA%\table-canon （内含「试用样例」库 demo-sample.tcs，会一并删除；自己新建的库不受影响）
 start "" explorer "%DIR%"
 (goto) 2>nul & del /f /q "%~f0"
